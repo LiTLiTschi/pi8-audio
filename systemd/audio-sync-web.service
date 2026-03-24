@@ -1,6 +1,6 @@
 [Unit]
 Description=Audio Sync Web UI (port 7700)
-After=pipewire.service
+After=pipewire.service display-daemon.service
 
 [Service]
 Type=simple

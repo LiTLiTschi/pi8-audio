@@ -141,36 +141,39 @@ def set_speaker_volumes(front_left, front_right, rear_left, rear_right):
 
 _loopback_proc = None  # subprocess.Popen for pw-loopback
 _scream_proc = None    # subprocess.Popen for scream-to-pipewire
+_proc_lock = threading.Lock()
 
 
 def start_usb_loopback():
     """Start pw-loopback: UFO202 line-in → combined sink."""
     global _loopback_proc
     stop_usb_loopback()
-    _loopback_proc = subprocess.Popen(
-        [
-            "pw-loopback",
-            "--capture-props", f"target.object={UFO202_SOURCE}",
-            "--playback-props", f"target.object=combined",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    with _proc_lock:
+        _loopback_proc = subprocess.Popen(
+            [
+                "pw-loopback",
+                "--capture-props", f"target.object={UFO202_SOURCE}",
+                "--playback-props", f"target.object=combined",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def stop_usb_loopback():
     """Stop any running pw-loopback process."""
     global _loopback_proc
-    if _loopback_proc is not None:
-        try:
-            _loopback_proc.terminate()
-            _loopback_proc.wait(timeout=3)
-        except Exception:
+    with _proc_lock:
+        if _loopback_proc is not None:
             try:
-                _loopback_proc.kill()
+                _loopback_proc.terminate()
+                _loopback_proc.wait(timeout=3)
             except Exception:
-                pass
-        _loopback_proc = None
+                try:
+                    _loopback_proc.kill()
+                except Exception:
+                    pass
+            _loopback_proc = None
 
 
 _scream_start_time = None  # timestamp when scream receiver was started
@@ -212,45 +215,48 @@ def start_scream_receiver(config=None):
     # Always receive 4 channels — Windows Scream stays in Quadraphonic (4.0).
     # PipeWire's combined sink handles channel routing based on stereo/surround mode.
     env["SCREAM_CHANNELS"] = "4"
-    _scream_proc = subprocess.Popen(
-        [os.path.expanduser("~/bin/scream-to-pipewire")],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid,
-        env=env,
-    )
-    _scream_start_time = time.time()
+    with _proc_lock:
+        _scream_proc = subprocess.Popen(
+            [os.path.expanduser("~/bin/scream-to-pipewire")],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+            env=env,
+        )
+        _scream_start_time = time.time()
 
 
 def stop_scream_receiver():
     """Stop any running scream receiver process."""
     global _scream_proc
-    if _scream_proc is not None:
-        try:
-            import signal
-            os.killpg(os.getpgid(_scream_proc.pid), signal.SIGTERM)
-            _scream_proc.wait(timeout=3)
-        except Exception:
+    with _proc_lock:
+        if _scream_proc is not None:
             try:
-                os.killpg(os.getpgid(_scream_proc.pid), signal.SIGKILL)
+                import signal
+                os.killpg(os.getpgid(_scream_proc.pid), signal.SIGTERM)
+                _scream_proc.wait(timeout=3)
             except Exception:
-                pass
-        _scream_proc = None
-        _scream_start_time = None
+                try:
+                    os.killpg(os.getpgid(_scream_proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            _scream_proc = None
+            _scream_start_time = None
 
 
 def get_scream_status():
     """Return status info for the scream receiver process."""
     global _scream_proc, _scream_start_time
-    if _scream_proc is None:
-        return {"running": False, "pid": None, "uptime_s": 0}
-    poll = _scream_proc.poll()
-    if poll is not None:
-        _scream_proc = None
-        _scream_start_time = None
-        return {"running": False, "pid": None, "uptime_s": 0, "exit_code": poll}
-    uptime = int(time.time() - _scream_start_time) if _scream_start_time else 0
-    return {"running": True, "pid": _scream_proc.pid, "uptime_s": uptime}
+    with _proc_lock:
+        if _scream_proc is None:
+            return {"running": False, "pid": None, "uptime_s": 0}
+        poll = _scream_proc.poll()
+        if poll is not None:
+            _scream_proc = None
+            _scream_start_time = None
+            return {"running": False, "pid": None, "uptime_s": 0, "exit_code": poll}
+        uptime = int(time.time() - _scream_start_time) if _scream_start_time else 0
+        return {"running": True, "pid": _scream_proc.pid, "uptime_s": uptime}
 
 
 def set_source(source):
@@ -476,6 +482,7 @@ def _gen_calib_stream(sink, stop_event):
         ["pw-cat", "--playback", f"--target={target_alsa}",
          "--format=s16", f"--rate={_SAMPLE_RATE}", "--channels=1", "-"],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _calib_procs.append(proc)
 
     try:
         proc.stdin.write(hdr)
@@ -513,15 +520,18 @@ def _gen_calib_stream(sink, stop_event):
 
 
 _calib_threads = []
+_calib_procs   = []  # pw-cat subprocesses, for early kill on stop
+
 
 def start_calib_stream(front_offset_ms, rear_offset_ms, volume):
-    global _calib_threads
+    global _calib_threads, _calib_procs
     stop_calib_stream()
     with _calib_lock:
         _calib_offset["front"]  = front_offset_ms
         _calib_offset["rear"]   = rear_offset_ms
         _calib_offset["volume"] = max(0.05, min(1.0, volume / 100))
     _calib_stop.clear()
+    _calib_procs = []
     _calib_threads = [
         threading.Thread(target=_gen_calib_stream, args=("front", _calib_stop), daemon=True),
         threading.Thread(target=_gen_calib_stream, args=("rear",  _calib_stop), daemon=True),
@@ -538,6 +548,12 @@ def update_calib_offset(front_offset_ms, rear_offset_ms, volume):
 
 def stop_calib_stream():
     _calib_stop.set()
+    # Kill pw-cat subprocesses first so threads unblock immediately
+    for p in list(_calib_procs):
+        try:
+            p.terminate()
+        except Exception:
+            pass
     for t in _calib_threads:
         t.join(timeout=1)
 
@@ -1499,9 +1515,17 @@ async function loadDisplayState() {
 }
 
 async function setDisplayMode(mode) {
-  const body = {mode, overlay_enabled: document.getElementById('disp-overlay').checked,
-                visualizer_mirror: document.getElementById('disp-mirror').checked};
-  await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  // Immediate visual feedback
+  document.querySelectorAll('.disp-btn').forEach(b => b.classList.remove('active'));
+  const map = {'off':'disp-off','now-playing':'disp-np','visualizer':'disp-vis','music-video':'disp-video'};
+  const btn = document.getElementById(map[mode]);
+  if (btn) { btn.classList.add('active'); btn.textContent = '\u23f3 ' + btn.textContent.replace(/^\u23f3 /,''); }
+
+  const s = { mode,
+    overlay_enabled: document.getElementById('disp-overlay').checked,
+    visualizer_mirror: document.getElementById('disp-mirror').checked };
+  await fetch('/display', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(s)});
   loadDisplayState();
 }
 
@@ -1906,6 +1930,10 @@ document.getElementById('sync-game-panel').addEventListener('toggle', async (e) 
 
 updateCalibDisplay();
 // ── Presets ───────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 function renderPresets(presets) {
   const list = document.getElementById('presets-list');
   list.innerHTML = '';
@@ -1925,8 +1953,8 @@ function renderPresets(presets) {
     row.style.cssText = 'display:flex;gap:0.4rem;align-items:center;background:#1a1a1a;border-radius:6px;padding:0.5rem 0.6rem';
     row.innerHTML = `
       <div style="flex:1;min-width:0;overflow:hidden">
-        <div style="font-weight:700;color:#ddd;font-size:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${name}</div>
-        <div style="font-size:0.72rem;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${info}</div>
+        <div style="font-weight:700;color:#ddd;font-size:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(name)}</div>
+        <div style="font-size:0.72rem;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(info)}</div>
       </div>
       <button onclick="loadPreset(${JSON.stringify(name)})"
         style="padding:0.35rem 0.7rem;background:#1a3a1a;color:#8f8;border:1px solid #464;border-radius:6px;font-size:0.85rem;cursor:pointer;white-space:nowrap;flex-shrink:0">▶ Laden</button>
@@ -2172,6 +2200,9 @@ const muteBtn  = document.getElementById('mute-btn');
 const playBtn  = document.getElementById('play-btn');
 let volTimeout = null;
 let isMuted = false;
+let _volDragging = false;
+volRange.addEventListener('pointerdown', () => { _volDragging = true; });
+volRange.addEventListener('pointerup',   () => { _volDragging = false; });
 
 // ── Volume ──
 function updateVolUI(v, muted) {
@@ -2237,6 +2268,7 @@ fetch('/volume').then(r => r.json()).then(d => updateVolUI(d.volume, d.muted));
 pollPlayer();
 setInterval(pollPlayer, 3000);
 setInterval(() => {
+  if (_volDragging) return;
   fetch('/volume').then(r => r.json()).then(d => updateVolUI(d.volume, d.muted));
 }, 5000);
 </script>
@@ -2685,11 +2717,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/buffers":
             front_buf = int(data.get("front", 2048))
             rear_buf  = int(data.get("rear", 512))
-            state = load_state()
-            state["buffer_front"] = front_buf
-            state["buffer_rear"]  = rear_buf
-            save_state(state)
             with _apply_lock:
+                state = load_state()
+                state["buffer_front"] = front_buf
+                state["buffer_rear"]  = rear_buf
+                save_state(state)
                 apply_buffers(front_buf, rear_buf)
                 subprocess.run(["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"], check=False)
                 time.sleep(3)
@@ -2867,12 +2899,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/volume":
             if data.get("mute_toggle"):
-                toggle_mute()
+                try:
+                    toggle_mute()
+                except subprocess.CalledProcessError as e:
+                    self.send_json(500, {"ok": False, "error": str(e)})
+                    return
                 self.send_json(200, {**get_master_volume(), "ok": True})
                 return
             vol = int(data.get("volume", 50))
             vol = max(0, min(150, vol))
-            set_master_volume(vol)
+            try:
+                set_master_volume(vol)
+            except subprocess.CalledProcessError as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
+                return
             self.send_json(200, {"ok": True, "volume": vol})
             return
 
