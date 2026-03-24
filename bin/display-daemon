@@ -35,6 +35,8 @@ log = logging.getLogger("display-daemon")
 # ── Constants ─────────────────────────────────────────────────────────────────
 STATE_FILE = Path.home() / ".config/display-state.json"
 DISPLAY_CONFIG_FILE = Path.home() / ".config/display-config.json"
+HISTORY_FILE = Path.home() / ".config" / "display-history.jsonl"
+HISTORY_MAX  = 200
 
 def load_display_config():
     try:
@@ -54,10 +56,11 @@ PORT       = 8084
 
 # ── Shared mutable state (all protected by _lock) ────────────────────────────
 _lock   = threading.Lock()
-_state  = {"mode": "off", "overlay_enabled": True, "visualizer_mirror": False}
+_state  = {"mode": "off", "overlay_enabled": True, "visualizer_mirror": False, "visualizer_theme": "default"}
 _track  = {"title": "", "artist": "", "artUrl": ""}
 _g      = {"status": "idle"}   # volatile string; use dict to avoid global rebind issues
 _queue  : queue.Queue = queue.Queue()
+_clock_timer: threading.Timer = None
 
 
 # ── Event types ───────────────────────────────────────────────────────────────
@@ -96,6 +99,27 @@ def save_state(s):
         tmp.rename(STATE_FILE)
     except Exception:
         pass
+
+
+def append_history(title: str, artist: str, album: str = ""):
+    if not title and not artist:
+        return
+    import datetime
+    entry = json.dumps({
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "title": title,
+        "artist": artist,
+        "album": album,
+    })
+    try:
+        lines = []
+        if HISTORY_FILE.exists():
+            lines = HISTORY_FILE.read_text().splitlines()
+        lines.append(entry)
+        lines = lines[-HISTORY_MAX:]
+        HISTORY_FILE.write_text("\n".join(lines) + "\n")
+    except Exception as e:
+        log.debug("history write failed: %s", e)
 
 
 # ── Online cover art lookup ────────────────────────────────────────────────────
@@ -405,6 +429,28 @@ def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album=""):
     return frame
 
 
+def render_clock_frame(W: int, H: int) -> "Image.Image":
+    """Render a minimal full-screen clock for the idle screensaver."""
+    import datetime
+    frame = Image.new("RGB", (W, H), (0, 0, 0))
+    draw = ImageDraw.Draw(frame)
+    now = datetime.datetime.now()
+    time_str = now.strftime("%H:%M")
+    date_str = now.strftime("%A, %d %B")
+    scale = H / 1080
+    try:
+        font_time = ImageFont.truetype(FONT_BOLD, int(180 * scale))
+        font_date = ImageFont.truetype(FONT_REG,  int(48  * scale))
+    except Exception:
+        font_time = font_date = ImageFont.load_default()
+    # Shadow then text for time
+    cx, cy = W // 2, H // 2
+    for dx, dy, col in [(3, 3, (0,0,0)), (0, 0, (220,220,220))]:
+        draw.text((cx+dx, cy-int(60*scale)+dy), time_str, font=font_time, fill=col, anchor="mm")
+    draw.text((cx, cy+int(80*scale)), date_str, font=font_date, fill=(120,120,120), anchor="mm")
+    return frame
+
+
 # ── Crossfade ─────────────────────────────────────────────────────────────────
 def crossfade_to(old_frame, new_frame, W, H):
     os.makedirs(CF_DIR, exist_ok=True)
@@ -426,7 +472,15 @@ def crossfade_to(old_frame, new_frame, W, H):
 
 
 # ── Visualizer frame ──────────────────────────────────────────────────────────
-def render_vis_frame(bars, W, H, mirror):
+_VIS_THEMES = {
+    "default": lambda ratio: (int(75*(1-ratio)), int(255*ratio), int(130+125*ratio)),  # purple→cyan
+    "fire":    lambda ratio: (int(220+35*ratio), int(60*ratio), 10),                    # red→orange
+    "ice":     lambda ratio: (int(50*ratio), int(180+75*ratio), 255),                   # blue→white
+    "amber":   lambda ratio: (200, int(100+100*ratio), 0),                              # dark amber→gold
+    "mono":    lambda ratio: (int(180*ratio+40),)*3,                                    # dark→bright grey
+}
+
+def render_vis_frame(bars, W, H, mirror, pixel_format=4, theme="default"):
     img  = Image.new("RGB", (W, H), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     n = max(len(bars), 1)
@@ -437,8 +491,8 @@ def render_vis_frame(bars, W, H, mirror):
         if bar_h == 0:
             continue
         x0    = int(i * slot_w + (slot_w - bar_w) / 2)
-        ratio = val / 1000
-        colour = (int(75*(1-ratio)), int(255*ratio), int(130+125*ratio))
+        theme_fn = _VIS_THEMES.get(theme, _VIS_THEMES["default"])
+        colour = theme_fn(val / 1000)
         draw.rectangle([x0, H - bar_h, x0 + bar_w - 1, H - 1], fill=colour)
         if mirror:
             draw.rectangle([x0, 0, x0 + bar_w - 1, bar_h - 1], fill=colour)
@@ -619,8 +673,9 @@ def display_controller():
                 if not vals: continue
                 with _lock:
                     mirror = _state.get("visualizer_mirror", False)
-                img = render_vis_frame(vals, fb_W[0], fb_H[0], mirror)
-                if fb_mm[0]: fb_write(fb_mm[0], img, fb_bpp[0])
+                    theme  = _state.get("visualizer_theme", "default")
+                frame = render_vis_frame(vals, fb_W[0], fb_H[0], mirror, fb_bpp[0], theme)
+                if fb_mm[0]: fb_write(fb_mm[0], frame, fb_bpp[0])
             cava_proc[0].wait()
 
         threading.Thread(target=vis_loop, daemon=True).start()
@@ -637,7 +692,11 @@ def display_controller():
 
     # ── mode transitions ───────────────────────────────────────────────────────
     def teardown(mode):
+        global _clock_timer
         if mode == "now-playing":
+            if _clock_timer:
+                _clock_timer.cancel()
+                _clock_timer = None
             kill_mpv(); chvt(1)
         elif mode == "visualizer":
             stop_cava(); close_fb(); chvt(1)
@@ -669,6 +728,10 @@ def display_controller():
     _rendering = [False]
 
     def do_render(ev):
+        global _clock_timer
+        if _clock_timer:
+            _clock_timer.cancel()
+            _clock_timer = None
         if _rendering[0]:
             return
         _rendering[0] = True
@@ -682,6 +745,7 @@ def display_controller():
             with _lock:
                 _track.update(title=ev.title, artist=ev.artist, artUrl=ev.artUrl)
                 _g["status"] = "playing" if (ev.title or ev.artist) else "idle"
+            append_history(ev.title, ev.artist, getattr(ev, "album", ""))
         finally:
             _rendering[0] = False
 
@@ -768,13 +832,34 @@ def display_controller():
                 do_render(t)
 
         elif isinstance(ev, StatusEvent):
+            global _clock_timer
+            with _lock:
+                _g["status"] = ev.status.lower() if ev.status else "idle"
+            # Start clock timer when idle in now-playing mode
+            if current_mode == "now-playing" and ev.status in ("Paused", "Stopped", ""):
+                if _clock_timer is None or not _clock_timer.is_alive():
+                    def _show_clock():
+                        try:
+                            frame = render_clock_frame(W, H)
+                            frame.save(NP_FILE)
+                            mpv_loadfile(NP_FILE)
+                        except Exception as e:
+                            log.debug("clock render failed: %s", e)
+                    _clock_timer = threading.Timer(60.0, _show_clock)
+                    _clock_timer.daemon = True
+                    _clock_timer.start()
+            elif ev.status == "Playing":
+                if _clock_timer:
+                    _clock_timer.cancel()
+                    _clock_timer = None
+            # Legacy behaviour for Stopped/""
             if ev.status in ("Stopped", ""):
                 with _lock: _g["status"] = "idle"
                 if current_mode == "now-playing":
                     black = Image.new("RGB", (W, H), (0,0,0))
                     black.save(NP_FILE); mpv_loadfile(NP_FILE)
                     old_frame[0] = black
-            else:
+            elif ev.status not in ("Paused",):
                 with _lock:
                     if _g["status"] not in ("searching", "no_videos_found",
                                             "cava_unavailable", "fb_permission_error"):
@@ -815,6 +900,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _lock:
                 data = {**_state, "track": dict(_track), "status": _g["status"]}
             self.send_json(200, data)
+        elif self.path == "/history":
+            try:
+                lines = HISTORY_FILE.read_text().splitlines() if HISTORY_FILE.exists() else []
+                entries = [json.loads(l) for l in reversed(lines) if l.strip()]
+                self.send_json(200, entries)
+            except Exception:
+                self.send_json(200, [])
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -831,6 +923,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with _lock:
             for k in ("mode", "overlay_enabled", "visualizer_mirror"):
                 if k in body: _state[k] = body[k]
+            if "visualizer_theme" in body and body["visualizer_theme"] in _VIS_THEMES:
+                _state["visualizer_theme"] = body["visualizer_theme"]
             ev = ModeChangeEvent(_state["mode"], _state["overlay_enabled"],
                                  _state["visualizer_mirror"])
             state_snapshot = dict(_state)
