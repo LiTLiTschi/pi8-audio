@@ -4,8 +4,11 @@ audio-sync-web — Web UI to fine-tune delay between BCM2835 (3.5mm) and CM108 (
 Runs on http://pi8:8083
 """
 
+import hashlib
 import http.server
 import json
+import logging
+import logging.handlers
 import os
 import signal
 import subprocess
@@ -13,6 +16,20 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+
+_LOG_FILE = "/tmp/pi8-audio.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            _LOG_FILE, maxBytes=2*1024*1024, backupCount=1, encoding="utf-8"
+        ),
+    ],
+)
+log = logging.getLogger("audio-sync-web")
 
 STATE_FILE    = os.path.expanduser("~/.config/audio-sync.json")
 DELAY_CONF    = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/audio-sync-delay.conf")
@@ -92,6 +109,70 @@ def set_master_volume(percent):
 
 def toggle_mute():
     subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], check=True)
+
+
+def restart_system_bluetooth_stack():
+    """Restart bluetoothd, wait out the Busy window, then re-run bt-speaker (discoverable + agent)."""
+    log.info("restarting system bluetooth + bt-speaker")
+    subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=False)
+    time.sleep(1.5)
+    subprocess.run(["systemctl", "--user", "restart", "bt-speaker"], check=False)
+
+
+# ── Log helpers ──────────────────────────────────────────────────────────────
+
+LOG_ENDPOINTS = {
+    "bt": {
+        "title": "Bluetooth",
+        "scope": "system",
+        "units": ["bluetooth"],
+    },
+    "bt-speaker": {
+        "title": "BT Speaker Agent",
+        "scope": "user",
+        "units": ["bt-speaker"],
+    },
+    "audio": {
+        "title": "Audio (PipeWire + Web UI)",
+        "scope": "user",
+        "units": ["pipewire", "pipewire-pulse", "wireplumber", "audio-sync-web", "dlna-renderer", "cast-receiver"],
+    },
+    "pw": {
+        "title": "PipeWire",
+        "scope": "user",
+        "units": ["pipewire", "pipewire-pulse", "wireplumber"],
+    },
+    "web": {
+        "title": "Web UI",
+        "scope": "user",
+        "units": ["audio-sync-web"],
+    },
+    "dlna": {
+        "title": "DLNA Renderer",
+        "scope": "user",
+        "units": ["dlna-renderer"],
+    },
+    "display": {
+        "title": "Display Stack",
+        "scope": "user",
+        "units": ["display-daemon", "mpris-proxy"],
+    },
+}
+
+
+def get_service_log(key: str, lines: int = 300) -> str:
+    cfg = LOG_ENDPOINTS.get(key)
+    if not cfg:
+        return ""
+    args = ["journalctl", "-n", str(lines), "--no-pager", "-o", "short-iso"]
+    if cfg.get("scope") == "user":
+        args.append("--user")
+    for unit in cfg.get("units", []):
+        args += ["-u", unit]
+    try:
+        return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as e:
+        return e.stdout or str(e)
 
 
 # ── MPRIS / playerctl helpers ─────────────────────────────────────────────────
@@ -885,7 +966,16 @@ HTML = """\
     font-size: 0.85rem;
   }
   .disp-btn:hover { background: #333; }
-  .disp-btn.active { background: #4af; color: #000; border-color: #4af; }
+  .disp-btn.active  { background: #4af; color: #000; border-color: #4af; font-weight: bold; box-shadow: 0 0 0 2px #fff; }
+  .disp-btn.pending { border-color: #fa0; color: #fa0; box-shadow: 0 0 0 1px #fa0; }
+  /* ── Toasts ── */
+  #toast-container{position:fixed;bottom:1.5rem;right:1.5rem;z-index:9999;display:flex;flex-direction:column;gap:0.5rem;pointer-events:none}
+  .toast{padding:0.55rem 1rem;border-radius:6px;font-size:0.85rem;color:#fff;opacity:1;transition:opacity 0.4s;pointer-events:none;max-width:260px;word-break:break-word}
+  .toast.info   {background:#1a5a8a;border:1px solid #2a7abf}
+  .toast.success{background:#1a5a2a;border:1px solid #2a8a3a}
+  .toast.error  {background:#5a1a1a;border:1px solid #9a2a2a}
+  .toast.warning{background:#5a3a00;border:1px solid #aa6600}
+  .toast.fade-out{opacity:0}
   .theme-btn{padding:0.3rem 0.6rem;background:#222;border:1px solid #444;border-radius:4px;color:#ccc;cursor:pointer;font-size:0.8rem}
   .theme-btn.active{background:#4af;color:#000;border-color:#4af}
 
@@ -1051,6 +1141,7 @@ HTML = """\
   <div class="tab-bar">
     <button class="tab-bar-btn active" onclick="switchTab('audio')">🎵 Audio</button>
     <button class="tab-bar-btn"        onclick="switchTab('display')">🖥 Display</button>
+    <button class="tab-bar-btn"        onclick="switchTab('system')">⚙ System</button>
   </div>
 
   <div class="tab-layout">
@@ -1232,29 +1323,6 @@ HTML = """\
     <a href="/remote" style="flex:1;text-align:center;padding:.75rem;background:#2a2a2a;color:#4af;border:1px solid #444;border-radius:8px;text-decoration:none;font-size:1rem">📱 Remote</a>
   </div>
 
-  <details id="services-panel" style="margin-top:1rem;border:1px solid #333;border-radius:8px;overflow:hidden">
-    <summary style="padding:0.75rem 1rem;background:#1a1a1a;cursor:pointer;font-size:0.9rem;color:#aaa;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
-      <span>🔧 Services neu starten</span>
-      <span style="font-size:0.75rem;color:#555">▼</span>
-    </summary>
-    <div style="padding:0.75rem;display:flex;flex-direction:column;gap:0.5rem">
-      <div class="net-row">
-        <button class="svc-btn" data-svc="pipewire pipewire-pulse wireplumber" data-scope="user">🔄 PipeWire</button>
-        <button class="svc-btn" data-svc="bluetooth" data-scope="system">🔵 Bluetooth</button>
-      </div>
-      <div class="net-row">
-        <button class="svc-btn" data-svc="audio-sync-web" data-scope="user">🌐 Web UI</button>
-        <button class="svc-btn" data-svc="dlna-renderer" data-scope="user">📡 DLNA</button>
-      </div>
-      <button class="svc-btn" data-svc="ALL" style="background:#500;color:#faa;border-color:#800;font-weight:600">⚡ Alle neu starten</button>
-      <hr style="border:none;border-top:1px solid #333;margin:0.25rem 0">
-      <div class="net-row">
-        <button id="power-stop-btn" onclick="powerAction('stop')" style="flex:1;padding:0.6rem 0.5rem;background:#300;color:#f88;border:1px solid #500;border-radius:8px;font-size:0.85rem;cursor:pointer">⏹ System stoppen</button>
-        <button id="power-start-btn" onclick="powerAction('start')" style="flex:1;padding:0.6rem 0.5rem;background:#030;color:#8f8;border:1px solid #050;border-radius:8px;font-size:0.85rem;cursor:pointer">▶ System starten</button>
-      </div>
-      <div id="svc-status" style="font-size:0.8rem;color:#888;min-height:1.2em;text-align:center"></div>
-    </div>
-  </details>
     </div><!-- /#tab-audio -->
 
     <div class="tab-pane" id="tab-display">
@@ -1265,11 +1333,21 @@ HTML = """\
       <span style="font-size:0.75rem;color:#555">▼</span>
     </summary>
     <div style="padding:1rem">
-      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem">
-        <button id="disp-off"   class="disp-btn" onclick="setDisplayMode('off')">TTY</button>
-        <button id="disp-np"    class="disp-btn" onclick="setDisplayMode('now-playing')">Now Playing</button>
-        <button id="disp-vis"   class="disp-btn" onclick="setDisplayMode('visualizer')">Visualizer</button>
-        <button id="disp-video" class="disp-btn" onclick="setDisplayMode('music-video')">Video</button>
+      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.5rem">
+        <button id="disp-off"   class="disp-btn" onclick="selectDisplayMode('off')">TTY</button>
+        <button id="disp-np"    class="disp-btn" onclick="selectDisplayMode('now-playing')">Now Playing</button>
+        <button id="disp-vis"   class="disp-btn" onclick="selectDisplayMode('visualizer')">Visualizer</button>
+        <button id="disp-video" class="disp-btn" onclick="selectDisplayMode('music-video')">Video</button>
+      </div>
+      <div id="disp-apply-row" style="display:none;margin-bottom:0.75rem;gap:0.5rem;align-items:center">
+        <button id="disp-apply-btn" onclick="applyDisplayMode()"
+                style="padding:0.4rem 0.9rem;background:#224;border:1px solid #4af;border-radius:4px;color:#4af;cursor:pointer;font-size:0.85rem;font-weight:600">
+          ▶ Apply — <span id="disp-apply-label"></span>
+        </button>
+        <button onclick="cancelPendingMode()"
+                style="padding:0.4rem 0.6rem;background:#222;border:1px solid #444;border-radius:4px;color:#888;cursor:pointer;font-size:0.8rem">
+          ✕
+        </button>
       </div>
       <div id="disp-overlay-row" style="display:none;margin-bottom:0.5rem">
         <label style="font-size:0.9rem;color:#ccc"><input type="checkbox" id="disp-overlay" onchange="applyDisplayOptions()"> Show title / artist overlay</label>
@@ -1335,6 +1413,120 @@ HTML = """\
       <div id="test-status" style="font-size:0.8rem;color:#777;margin-top:0.5rem"></div>
     </div>
   </details>
+
+  <!-- ── Video settings ── -->
+  <details id="video-settings-panel" style="margin-top:1rem;border:1px solid #333;border-radius:6px">
+    <summary style="padding:0.6rem 1rem;background:#1a1a1a;cursor:pointer;display:flex;justify-content:space-between;align-items:center;border-radius:6px;user-select:none">
+      <span>🎬 Video Settings</span>
+      <span style="font-size:0.75rem;color:#555">▼</span>
+    </summary>
+    <div style="padding:1rem;display:flex;flex-direction:column;gap:0.75rem;font-size:0.85rem">
+
+      <!-- ── Search ── -->
+      <div style="color:#555;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid #2a2a2a;padding-bottom:0.3rem">Search</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem">
+        <div>
+          <label style="color:#aaa;display:block;margin-bottom:0.3rem">Max resolution:</label>
+          <select id="video-max-resolution" style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%">
+            <option value="360p">360p</option>
+            <option value="480p">480p</option>
+            <option value="720p" selected>720p (default)</option>
+            <option value="1080p">1080p</option>
+            <option value="best">Best available</option>
+          </select>
+        </div>
+        <div>
+          <label style="color:#aaa;display:block;margin-bottom:0.3rem">Max candidates:</label>
+          <select id="video-max-candidates" style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%">
+            <option value="1" selected>1 (fastest)</option>
+            <option value="3">3 (pick best match)</option>
+            <option value="5">5 (most thorough)</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem">
+        <div>
+          <label style="color:#aaa;display:block;margin-bottom:0.3rem">Search timeout (s):</label>
+          <input type="number" id="video-search-timeout" min="5" max="120" value="30"
+                 style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%;box-sizing:border-box">
+        </div>
+        <div>
+          <label style="color:#aaa;display:block;margin-bottom:0.3rem">Fuzzy threshold:</label>
+          <input type="number" id="video-fuzzy-threshold" min="0" max="1" step="0.05" value="0"
+                 style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%;box-sizing:border-box">
+          <div style="color:#555;font-size:0.7rem;margin-top:0.2rem">0 = disabled, 0.6 = medium, 1 = exact</div>
+        </div>
+      </div>
+      <div>
+        <label style="color:#aaa;display:block;margin-bottom:0.3rem">Primary search template:</label>
+        <input type="text" id="video-search-template" value="{artist} {title} official music video"
+               style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%;box-sizing:border-box"
+               placeholder="{artist} {title} official music video">
+        <div style="color:#555;font-size:0.7rem;margin-top:0.2rem">Use {artist} and {title} as placeholders</div>
+      </div>
+      <div>
+        <label style="color:#aaa">
+          <input type="checkbox" id="video-fallback-enabled"
+                 onchange="document.getElementById('video-fallback-row').style.display=this.checked?'':'none'">
+          Enable fallback search if primary fails/is rejected
+        </label>
+      </div>
+      <div id="video-fallback-row" style="display:none">
+        <label style="color:#aaa;display:block;margin-bottom:0.3rem">Fallback search template:</label>
+        <input type="text" id="video-fallback-template" value="{artist} {title}"
+               style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%;box-sizing:border-box"
+               placeholder="{artist} {title}">
+      </div>
+
+      <div>
+        <label style="color:#aaa;display:block;margin-bottom:0.3rem">Must include in title (comma-separated):</label>
+        <input type="text" id="video-must-include" value=""
+               style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%;box-sizing:border-box"
+               placeholder='e.g. "music video" or "official,music video"'>
+        <div style="color:#555;font-size:0.75rem;margin-top:0.2rem">Reject any result whose title doesn't contain ALL listed phrases</div>
+      </div>
+
+      <!-- ── Behavior ── -->
+      <div style="color:#555;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid #2a2a2a;padding-bottom:0.3rem;margin-top:0.25rem">Behavior</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem">
+        <div>
+          <label style="color:#aaa;display:block;margin-bottom:0.3rem">If no video found:</label>
+          <select id="video-no-found" style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%">
+            <option value="skip">Skip track (try next)</option>
+            <option value="cover_art">Show cover art and wait</option>
+          </select>
+        </div>
+        <div>
+          <label style="color:#aaa;display:block;margin-bottom:0.3rem">Skip threshold:</label>
+          <input type="number" id="video-skip-threshold" min="1" max="20" value="3"
+                 style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%;box-sizing:border-box">
+          <div style="color:#555;font-size:0.7rem;margin-top:0.2rem">consecutive misses before fallback</div>
+        </div>
+      </div>
+      <div>
+        <label style="color:#aaa;display:block;margin-bottom:0.3rem">After video ends:</label>
+        <select id="video-after-ends" style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%">
+          <option value="next" selected>Skip to next track</option>
+          <option value="loop">Loop video</option>
+          <option value="cover_art">Show cover art</option>
+        </select>
+      </div>
+
+      <!-- ── Audio ── -->
+      <div style="color:#555;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid #2a2a2a;padding-bottom:0.3rem;margin-top:0.25rem">Audio</div>
+      <div>
+        <label style="color:#aaa;display:block;margin-bottom:0.3rem">BT mute during video:</label>
+        <select id="video-bt-mute" style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem 0.5rem;width:100%">
+          <option value="always" selected>Always mute BT audio</option>
+          <option value="never">Never mute (both play)</option>
+        </select>
+      </div>
+
+      <button onclick="saveVideoSettings()" style="padding:0.4rem 0.8rem;background:#234;border:1px solid #456;border-radius:4px;color:#adf;cursor:pointer;align-self:flex-start;margin-top:0.25rem">💾 Save</button>
+      <div id="video-settings-status" style="font-size:0.8rem;color:#888;min-height:1.2em"></div>
+    </div>
+  </details>
+
 
   <details id="history-panel" style="margin-top:1rem;border:1px solid #333;border-radius:8px;overflow:hidden">
     <summary style="padding:0.75rem 1rem;background:#1a1a1a;cursor:pointer;font-size:0.9rem;color:#aaa;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
@@ -1410,6 +1602,76 @@ HTML = """\
     </div>
   </details>
 
+    </div><!-- /#tab-display -->
+
+    <div class="tab-pane" id="tab-system">
+
+  <!-- ── Restart ── -->
+  <details id="services-panel" open style="border:1px solid #333;border-radius:8px;overflow:hidden">
+    <summary style="padding:0.75rem 1rem;background:#1a1a1a;cursor:pointer;font-size:0.9rem;color:#aaa;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
+      <span>🔧 Services neu starten</span>
+      <span style="font-size:0.75rem;color:#555">▼</span>
+    </summary>
+    <div style="padding:0.75rem;display:flex;flex-direction:column;gap:0.5rem">
+      <div style="color:#555;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:0.1rem">Audio</div>
+      <div class="net-row">
+        <button class="svc-btn" data-svc="pipewire pipewire-pulse wireplumber" data-scope="user">🔄 PipeWire</button>
+        <button class="svc-btn" data-svc="bluetooth" data-scope="system">🔵 Bluetooth</button>
+      </div>
+      <div class="net-row">
+        <button class="svc-btn" data-svc="audio-sync-web" data-scope="user">🌐 Web UI</button>
+        <button class="svc-btn" data-svc="dlna-renderer" data-scope="user">📡 DLNA</button>
+      </div>
+      <div style="color:#555;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;margin-top:0.25rem;margin-bottom:0.1rem">Display</div>
+      <div class="net-row">
+        <button class="svc-btn disp-svc-btn" data-svc="display-daemon" data-scope="user">↺ display-daemon</button>
+        <button class="svc-btn disp-svc-btn" data-svc="mpris-proxy" data-scope="user">↺ mpris-proxy</button>
+      </div>
+      <button class="svc-btn disp-svc-btn" data-svc="DISPLAY_RESTART" data-scope="user" style="background:#224;border-color:#446;color:#aaf;font-weight:600">⚡ Display Full Restart</button>
+      <hr style="border:none;border-top:1px solid #333;margin:0.25rem 0">
+      <button class="svc-btn" data-svc="ALL" style="background:#500;color:#faa;border-color:#800;font-weight:600">⚡ Alle neu starten</button>
+      <hr style="border:none;border-top:1px solid #333;margin:0.25rem 0">
+      <div class="net-row">
+        <button id="power-stop-btn" onclick="powerAction('stop')" style="flex:1;padding:0.6rem 0.5rem;background:#300;color:#f88;border:1px solid #500;border-radius:8px;font-size:0.85rem;cursor:pointer">⏹ System stoppen</button>
+        <button id="power-start-btn" onclick="powerAction('start')" style="flex:1;padding:0.6rem 0.5rem;background:#030;color:#8f8;border:1px solid #050;border-radius:8px;font-size:0.85rem;cursor:pointer">▶ System starten</button>
+      </div>
+      <div id="svc-status" style="font-size:0.8rem;color:#888;min-height:1.2em;text-align:center"></div>
+      <div id="disp-svc-status" style="font-size:0.8rem;color:#888;min-height:1.2em;text-align:center"></div>
+    </div>
+  </details>
+
+  <!-- ── Debug Info ── -->
+  <details id="debug-panel" style="margin-top:1rem;border:1px solid #333;border-radius:6px">
+    <summary style="padding:0.6rem 1rem;background:#1a1a1a;cursor:pointer;display:flex;justify-content:space-between;align-items:center;border-radius:6px;user-select:none">
+      <span>🔍 Debug Info</span>
+      <span style="font-size:0.75rem;color:#555">▼</span>
+    </summary>
+    <div style="padding:1rem">
+      <div id="debug-mpv" style="font-size:0.8rem;color:#aaa;margin-bottom:0.75rem;background:#111;padding:0.6rem;border-radius:4px;font-family:monospace;white-space:pre"></div>
+      <div style="font-size:0.75rem;color:#555;margin-bottom:0.3rem">
+        Display log: <a href="/display-log-ui" target="_blank" style="color:#668;text-decoration:none"
+          onclick="this.href='/display-log-ui?t=' + Date.now()">open</a>
+      </div>
+      <div style="font-size:0.75rem;color:#555;display:flex;flex-wrap:wrap;gap:0.5rem">
+        Logs:
+        <a href="/log/bt" target="_blank" style="color:#668;text-decoration:none"
+          onclick="this.href='/log/bt?t=' + Date.now()">bt</a>
+        <a href="/log/bt-speaker" target="_blank" style="color:#668;text-decoration:none"
+          onclick="this.href='/log/bt-speaker?t=' + Date.now()">bt-speaker</a>
+        <a href="/log/audio" target="_blank" style="color:#668;text-decoration:none"
+          onclick="this.href='/log/audio?t=' + Date.now()">audio</a>
+        <a href="/log/pw" target="_blank" style="color:#668;text-decoration:none"
+          onclick="this.href='/log/pw?t=' + Date.now()">pipewire</a>
+        <a href="/log/web" target="_blank" style="color:#668;text-decoration:none"
+          onclick="this.href='/log/web?t=' + Date.now()">web</a>
+        <a href="/log/dlna" target="_blank" style="color:#668;text-decoration:none"
+          onclick="this.href='/log/dlna?t=' + Date.now()">dlna</a>
+        <a href="/log/display" target="_blank" style="color:#668;text-decoration:none"
+          onclick="this.href='/log/display?t=' + Date.now()">display</a>
+      </div>
+    </div>
+  </details>
+
   <!-- ── Presets ── -->
   <details id="presets-panel" style="margin-top:1rem;border:1px solid #353;border-radius:8px;overflow:hidden">
     <summary style="padding:0.75rem 1rem;background:#111e11;cursor:pointer;font-size:0.9rem;color:#aca;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
@@ -1427,7 +1689,8 @@ HTML = """\
       <div id="preset-status" style="font-size:0.8rem;color:#888;text-align:center;min-height:1.2em"></div>
     </div>
   </details>
-    </div><!-- /#tab-display -->
+
+    </div><!-- /#tab-system -->
   </div><!-- /.tab-layout -->
 
   <div id="status"></div>
@@ -1632,14 +1895,25 @@ function switchTab(name) {
   document.querySelectorAll('.tab-bar-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name)?.classList.add('active');
   document.querySelectorAll('.tab-bar-btn').forEach(b => {
-    if (b.textContent.includes(name === 'audio' ? '🎵' : '🖥'))
+    if (b.textContent.includes(name === 'audio' ? '🎵' : name === 'display' ? '🖥' : '⚙'))
       b.classList.add('active');
   });
   if (name === 'display') loadDisplayState();
 }
 
+// ── Toast notifications ──
+function showToast(msg, type = 'info', duration = 3000) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.getElementById('toast-container').appendChild(el);
+  const remove = () => el.remove();
+  setTimeout(() => { el.classList.add('fade-out'); setTimeout(remove, 400); }, duration);
+}
+
 // ── Display control ──
 let _dispMode = 'off';
+let _pendingMode = null;
 let _dispPollTimer = null;
 const _dispStatusText = {
   idle: 'No player connected',
@@ -1651,21 +1925,32 @@ const _dispStatusText = {
   daemon_down: 'Display service unavailable',
 };
 
+function _updateDispButtons(currentMode) {
+  const map = {'off':'disp-off','now-playing':'disp-np','visualizer':'disp-vis','music-video':'disp-video'};
+  document.querySelectorAll('.disp-btn').forEach(b => { b.classList.remove('active'); b.classList.remove('pending'); });
+  document.getElementById(map[currentMode])?.classList.add('active');
+  if (_pendingMode && _pendingMode !== currentMode) {
+    document.getElementById(map[_pendingMode])?.classList.add('pending');
+    const labels = {'off':'TTY','now-playing':'Now Playing','visualizer':'Visualizer','music-video':'Video'};
+    document.getElementById('disp-apply-label').textContent = labels[_pendingMode] || _pendingMode;
+    document.getElementById('disp-apply-row').style.display = 'flex';
+  } else {
+    _pendingMode = null;
+    document.getElementById('disp-apply-row').style.display = 'none';
+  }
+}
+
 async function loadDisplayState() {
   try {
     const s = await fetch('/display-state').then(r => r.json());
     _dispMode = s.mode;
     const daemonDown = s.status === 'daemon_down';
     document.querySelectorAll('.disp-btn').forEach(b => {
-      b.classList.remove('active');
       b.disabled = daemonDown;
       b.style.opacity = daemonDown ? '0.4' : '';
       b.style.cursor  = daemonDown ? 'not-allowed' : '';
     });
-    if (!daemonDown) {
-      const map = {'off':'disp-off','now-playing':'disp-np','visualizer':'disp-vis','music-video':'disp-video'};
-      document.getElementById(map[s.mode])?.classList.add('active');
-    }
+    if (!daemonDown) _updateDispButtons(s.mode);
     document.getElementById('disp-overlay-row').style.display = s.mode === 'now-playing' ? '' : 'none';
     document.getElementById('disp-mirror-row').style.display  = s.mode === 'visualizer'  ? '' : 'none';
     document.getElementById('disp-theme-row').style.display =
@@ -1676,6 +1961,7 @@ async function loadDisplayState() {
     document.getElementById('disp-overlay').checked = !!s.overlay_enabled;
     document.getElementById('disp-mirror').checked  = !!s.visualizer_mirror;
     document.getElementById('disp-lyrics').checked  = s.lyrics_enabled !== false;
+    _populateVideoSettings(s);
     const t = s.track;
     const statusEl = document.getElementById('disp-status');
     if (s.status === 'playing' && t && (t.title || t.artist)) {
@@ -1692,19 +1978,43 @@ async function loadDisplayState() {
   updateSleepStatus();
 }
 
-async function setDisplayMode(mode) {
-  // Immediate visual feedback
-  document.querySelectorAll('.disp-btn').forEach(b => b.classList.remove('active'));
-  const map = {'off':'disp-off','now-playing':'disp-np','visualizer':'disp-vis','music-video':'disp-video'};
-  const btn = document.getElementById(map[mode]);
-  if (btn) { btn.classList.add('active'); btn.textContent = '\u23f3 ' + btn.textContent.replace(/^\u23f3 /,''); }
+function selectDisplayMode(mode) {
+  if (mode === _dispMode) {
+    _pendingMode = null;
+    _updateDispButtons(_dispMode);
+    return;
+  }
+  _pendingMode = mode;
+  _updateDispButtons(_dispMode);
+}
 
-  const s = { mode,
+function cancelPendingMode() {
+  _pendingMode = null;
+  _updateDispButtons(_dispMode);
+}
+
+async function applyDisplayMode() {
+  if (!_pendingMode) return;
+  const mode = _pendingMode;
+  const labels = {'off':'TTY','now-playing':'Now Playing','visualizer':'Visualizer','music-video':'Video'};
+  document.getElementById('disp-apply-btn').disabled = true;
+  showToast('Switching to ' + (labels[mode] || mode) + '…', 'info');
+  const body = { mode,
     overlay_enabled: document.getElementById('disp-overlay').checked,
     visualizer_mirror: document.getElementById('disp-mirror').checked,
     lyrics_enabled: document.getElementById('disp-lyrics').checked };
-  await fetch('/display', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify(s)});
+  try {
+    const res = await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (res.ok) {
+      _pendingMode = null;
+      showToast('Switched to ' + (labels[mode] || mode), 'success');
+    } else {
+      showToast('Switch failed (' + res.status + ')', 'error');
+    }
+  } catch(e) {
+    showToast('Switch failed: ' + e, 'error');
+  }
+  document.getElementById('disp-apply-btn').disabled = false;
   loadDisplayState();
 }
 
@@ -1712,7 +2022,10 @@ async function applyDisplayOptions() {
   const body = {mode: _dispMode, overlay_enabled: document.getElementById('disp-overlay').checked,
                 visualizer_mirror: document.getElementById('disp-mirror').checked,
                 lyrics_enabled: document.getElementById('disp-lyrics').checked};
-  await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  try {
+    await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    showToast('Settings updated', 'success', 2000);
+  } catch(e) { showToast('Error: ' + e, 'error'); }
 }
 
 async function loadHistory() {
@@ -1773,6 +2086,84 @@ document.getElementById('display-panel').addEventListener('toggle', e => {
   } else {
     clearInterval(_dispPollTimer);
     _dispPollTimer = null;
+  }
+});
+
+// ── Video settings ──
+async function saveVideoSettings() {
+  const body = {
+    video_no_found_action:  document.getElementById('video-no-found').value,
+    video_skip_threshold:   parseInt(document.getElementById('video-skip-threshold').value) || 3,
+    video_search_template:  document.getElementById('video-search-template').value.trim() || '{artist} {title} official music video',
+    video_max_resolution:   document.getElementById('video-max-resolution').value,
+    video_max_candidates:   parseInt(document.getElementById('video-max-candidates').value) || 1,
+    video_search_timeout:   parseInt(document.getElementById('video-search-timeout').value) || 30,
+    video_fuzzy_threshold:  parseFloat(document.getElementById('video-fuzzy-threshold').value) || 0,
+    video_fallback_enabled: document.getElementById('video-fallback-enabled').checked,
+    video_fallback_template:document.getElementById('video-fallback-template').value.trim() || '{artist} {title}',
+    video_after_ends:       document.getElementById('video-after-ends').value,
+    video_bt_mute:          document.getElementById('video-bt-mute').value,
+    video_must_include:     document.getElementById('video-must-include').value.trim(),
+  };
+  try {
+    await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    showToast('Video settings saved', 'success');
+  } catch(e) { showToast('Save failed: ' + e, 'error'); }
+}
+
+function _populateVideoSettings(s) {
+  if (s.video_no_found_action != null) document.getElementById('video-no-found').value = s.video_no_found_action;
+  if (s.video_skip_threshold  != null) document.getElementById('video-skip-threshold').value = s.video_skip_threshold;
+  if (s.video_search_template)         document.getElementById('video-search-template').value = s.video_search_template;
+  if (s.video_max_resolution)          document.getElementById('video-max-resolution').value = s.video_max_resolution;
+  if (s.video_max_candidates  != null) document.getElementById('video-max-candidates').value = s.video_max_candidates;
+  if (s.video_search_timeout  != null) document.getElementById('video-search-timeout').value = s.video_search_timeout;
+  if (s.video_fuzzy_threshold != null) document.getElementById('video-fuzzy-threshold').value = s.video_fuzzy_threshold;
+  if (s.video_fallback_enabled != null) {
+    document.getElementById('video-fallback-enabled').checked = s.video_fallback_enabled;
+    document.getElementById('video-fallback-row').style.display = s.video_fallback_enabled ? '' : 'none';
+  }
+  if (s.video_fallback_template) document.getElementById('video-fallback-template').value = s.video_fallback_template;
+  if (s.video_after_ends)        document.getElementById('video-after-ends').value = s.video_after_ends;
+  if (s.video_bt_mute)           document.getElementById('video-bt-mute').value = s.video_bt_mute;
+  if (s.video_must_include != null) document.getElementById('video-must-include').value = s.video_must_include;
+}
+
+// ── Debug panel ──
+let _debugPollTimer = null;
+
+function _fmtMpv(m) {
+  if (!m) return 'mpv: not running';
+  const isVideo = m.video_codec && !m.video_codec.includes('none');
+  const fn = (m.filename || '').includes('youtube') ? '▶ YouTube video' : (m.filename || '?');
+  const pos  = m.time_pos != null ? Math.floor(m.time_pos) : null;
+  const dur  = m.duration  != null ? Math.floor(m.duration)  : null;
+  const prog = pos != null && dur ? `${pos}s / ${dur}s` : '';
+  return [
+    `mpv  : ${m.current_vo || '?'} | ${isVideo ? '🎬 video' : '🖼 image'}`,
+    isVideo ? `video: ${m.video_codec || '?'} ${m.width || '?'}×${m.height || '?'} @ ${m.container_fps || '?'}fps` : null,
+    prog ? `pos  : ${prog}` : null,
+    `file : ${fn}`,
+    `pause: ${m.pause}`,
+  ].filter(Boolean).join('\\n');
+}
+
+async function _refreshDebug() {
+  try {
+    const s = await fetch('/display-state').then(r => r.json());
+    document.getElementById('debug-mpv').textContent = _fmtMpv(s.mpv);
+    _populateVideoSettings(s);
+  } catch(e) { document.getElementById('debug-mpv').textContent = 'daemon down'; }
+}
+
+document.getElementById('debug-panel').addEventListener('toggle', e => {
+  if (e.target.open) { _refreshDebug(); _debugPollTimer = setInterval(_refreshDebug, 5000); }
+  else { clearInterval(_debugPollTimer); _debugPollTimer = null; }
+});
+
+document.getElementById('video-settings-panel').addEventListener('toggle', e => {
+  if (e.target.open) {
+    fetch('/display-state').then(r => r.json()).then(_populateVideoSettings).catch(() => {});
   }
 });
 
@@ -2011,10 +2402,9 @@ document.querySelectorAll('.svc-btn').forEach(btn => {
   btn.addEventListener('click', async () => {
     const svc = btn.dataset.svc;
     const scope = btn.dataset.scope || 'user';
-    const svcStatus = document.getElementById('svc-status');
+    const label = svc === 'ALL' ? 'all services' : svc === 'DISPLAY_RESTART' ? 'display stack' : svc;
     document.querySelectorAll('.svc-btn').forEach(b => b.disabled = true);
-    svcStatus.style.color = '#fa0';
-    svcStatus.textContent = `Starte ${svc === 'ALL' ? 'alle Services' : svc} neu…`;
+    showToast('Restarting ' + label + '…', 'info');
     try {
       const res = await fetch('/restart-service', {
         method: 'POST',
@@ -2022,11 +2412,9 @@ document.querySelectorAll('.svc-btn').forEach(btn => {
         body: JSON.stringify({ service: svc, scope })
       });
       const data = await res.json();
-      svcStatus.style.color = data.ok ? '#4c4' : '#f44';
-      svcStatus.textContent = data.msg;
+      showToast(data.ok ? label + ' restarted' : 'Error: ' + data.msg, data.ok ? 'success' : 'error', 4000);
     } catch(e) {
-      svcStatus.style.color = '#f44';
-      svcStatus.textContent = 'Fehler: ' + e;
+      showToast('Error: ' + e, 'error', 4000);
     }
     document.querySelectorAll('.svc-btn').forEach(b => b.disabled = false);
   });
@@ -2297,6 +2685,7 @@ async function togglePresetDay(name, day, btn) {
   if (d.ok) btn.classList.toggle('active');
 }
 </script>
+<div id="toast-container"></div>
 </body>
 </html>
 """
@@ -2902,6 +3291,134 @@ function testSpeaker(ch) {
 </html>
 """
 
+# ── Display Log UI ────────────────────────────────────────────────────────────
+
+LOG_HTML = """\
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Display Log</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #0b0b0b;
+    color: #ddd;
+    min-height: 100vh;
+    padding: 1rem;
+  }
+  h1 { font-size: 1.1rem; margin-bottom: 0.4rem; color: #aaa; }
+  .toolbar {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 0.6rem;
+  }
+  button, select {
+    background: #1a1a1a;
+    color: #ccc;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  button:hover { background: #222; }
+  button.primary { border-color: #4af; color: #4af; }
+  .status { font-size: 0.8rem; color: #666; margin-left: auto; }
+  pre {
+    background: #060606;
+    border: 1px solid #222;
+    border-radius: 8px;
+    padding: 0.75rem;
+    font-size: 0.75rem;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: calc(100vh - 130px);
+    overflow: auto;
+  }
+</style>
+</head>
+<body>
+  <h1>🪵 Display Log</h1>
+  <div class="toolbar">
+    <button id="refresh-btn" class="primary">Refresh</button>
+    <button id="auto-btn">Auto: On</button>
+    <select id="interval">
+      <option value="2000">2s</option>
+      <option value="3000" selected>3s</option>
+      <option value="5000">5s</option>
+      <option value="10000">10s</option>
+    </select>
+    <button id="bottom-btn">Scroll to bottom</button>
+    <span class="status" id="status">—</span>
+  </div>
+  <pre id="log">Loading…</pre>
+
+<script>
+let auto = true;
+let timer = null;
+
+async function loadLog() {
+  const st = document.getElementById('status');
+  try {
+    const res = await fetch('/display-log', {cache: 'no-store'});
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    const pre = document.getElementById('log');
+    pre.textContent = text || '(empty)';
+    st.textContent = 'Updated: ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('log').textContent = 'unavailable';
+    st.textContent = 'Error: ' + e.message;
+  }
+}
+
+function startAuto() {
+  stopAuto();
+  const ms = parseInt(document.getElementById('interval').value, 10) || 3000;
+  timer = setInterval(loadLog, ms);
+}
+
+function stopAuto() {
+  if (timer) clearInterval(timer);
+  timer = null;
+}
+
+document.getElementById('refresh-btn').addEventListener('click', loadLog);
+document.getElementById('auto-btn').addEventListener('click', () => {
+  auto = !auto;
+  document.getElementById('auto-btn').textContent = 'Auto: ' + (auto ? 'On' : 'Off');
+  if (auto) startAuto(); else stopAuto();
+});
+document.getElementById('interval').addEventListener('change', () => {
+  if (auto) startAuto();
+});
+document.getElementById('bottom-btn').addEventListener('click', () => {
+  const pre = document.getElementById('log');
+  pre.scrollTop = pre.scrollHeight;
+});
+
+loadLog();
+startAuto();
+</script>
+</body>
+</html>
+"""
+
+# ── Cache busting — ETag per HTML page ────────────────────────────────────────
+def _etag(content: str) -> str:
+    return '"' + hashlib.md5(content.encode()).hexdigest()[:12] + '"'
+
+_ETAG_MAIN   = _etag(HTML)
+_ETAG_REMOTE = _etag(REMOTE_HTML)
+_ETAG_DEBUG  = _etag(DEBUG_HTML)
+_ETAG_LOG    = _etag(LOG_HTML)
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 _apply_lock = threading.Lock()
@@ -2928,6 +3445,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_html(self, html: str, etag: str):
+        """Serve HTML with ETag-based cache revalidation.
+        Returns 304 if browser already has the current version."""
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(body))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2967,19 +3501,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/presets":
             self.send_json(200, {"ok": True, "presets": get_presets()})
         elif self.path == "/remote":
-            body = REMOTE_HTML.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_html(REMOTE_HTML, _ETAG_REMOTE)
         elif self.path == "/debug":
-            body = DEBUG_HTML.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_html(DEBUG_HTML, _ETAG_DEBUG)
+        elif self.path == "/display-log-ui":
+            self.send_html(LOG_HTML, _ETAG_LOG)
         elif self.path == "/apply-status":
             with _apply_status_lock:
                 self.send_json(200, dict(_apply_status))
@@ -3013,13 +3539,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(data)
             except Exception:
                 self.send_response(503); self.end_headers()
+        elif self.path == "/display-log":
+            try:
+                with urllib.request.urlopen("http://localhost:8084/log", timeout=2) as r:
+                    data = r.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", len(data))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self.send_response(503); self.end_headers()
+        elif self.path.startswith("/log/"):
+            parsed = urllib.parse.urlparse(self.path)
+            key = parsed.path[len("/log/"):]
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            try:
+                lines = int(qs.get("n", ["300"])[0])
+            except Exception:
+                lines = 300
+            lines = max(50, min(2000, lines))
+            text = get_service_log(key, lines=lines)
+            if not text:
+                msg = f"unknown log key: {key}. valid: {', '.join(sorted(LOG_ENDPOINTS.keys()))}\n"
+                data = msg.encode()
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", len(data))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                data = text.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", len(data))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
         else:
-            body = HTML.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_html(HTML, _ETAG_MAIN)
 
     def do_POST(self):
         if self.path == "/simulate":
@@ -3174,7 +3737,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/restart-service":
             svc   = data.get("service", "")
             scope = data.get("scope", "user")
-            ALLOWED_USER   = {"pipewire", "pipewire-pulse", "wireplumber", "audio-sync-web", "dlna-renderer", "cast-receiver"}
+            ALLOWED_USER   = {"pipewire", "pipewire-pulse", "wireplumber", "audio-sync-web", "dlna-renderer", "cast-receiver", "display-daemon", "mpris-proxy"}
             ALLOWED_SYSTEM = {"bluetooth"}
             ALL_SERVICES   = [
                 ("user",   "pipewire pipewire-pulse wireplumber"),
@@ -3189,14 +3752,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     for sc, svcs in ALL_SERVICES:
                         if "audio-sync-web" in svcs:
                             continue
-                        flag = "--user" if sc == "user" else "--system"
-                        subprocess.run(["systemctl", flag, "restart"] + svcs.split(), check=False)
+                        if sc == "user":
+                            subprocess.run(["systemctl", "--user", "restart"] + svcs.split(), check=False)
+                        elif svcs.strip() == "bluetooth":
+                            restart_system_bluetooth_stack()
+                        else:
+                            subprocess.run(["sudo", "systemctl", "restart"] + svcs.split(), check=False)
                         time.sleep(1)
                     self.send_json(200, {"ok": True, "msg": "Alle Services neu gestartet. Web UI startet gleich neu…"})
                     def _restart_self():
                         time.sleep(1)
                         subprocess.run(["systemctl", "--user", "restart", "audio-sync-web"], check=False)
                     threading.Thread(target=_restart_self, daemon=True).start()
+                elif svc == "DISPLAY_RESTART":
+                    # Ordered: mpris-proxy → display-daemon
+                    subprocess.run(["systemctl", "--user", "restart", "mpris-proxy"], check=False)
+                    time.sleep(1)
+                    subprocess.run(["systemctl", "--user", "restart", "display-daemon"], check=False)
+                    self.send_json(200, {"ok": True, "msg": "mpris-proxy + display-daemon neu gestartet."})
                 else:
                     parts = svc.split()
                     if scope == "system":
@@ -3206,8 +3779,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not all(p in allowed for p in parts):
                         self.send_json(400, {"ok": False, "msg": f"Service nicht erlaubt: {svc}"})
                         return
-                    flag = "--user" if scope == "user" else "--system"
-                    subprocess.run(["systemctl", flag, "restart"] + parts, check=False)
+                    if scope == "user":
+                        subprocess.run(["systemctl", "--user", "restart"] + parts, check=False)
+                    elif parts == ["bluetooth"]:
+                        restart_system_bluetooth_stack()
+                    else:
+                        subprocess.run(["sudo", "systemctl", "restart"] + parts, check=False)
                     self.send_json(200, {"ok": True, "msg": f"{svc} neu gestartet."})
             except Exception as e:
                 self.send_json(500, {"ok": False, "msg": str(e)})
@@ -3317,12 +3894,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     stop_usb_loopback()
                     stop_scream_receiver()
                     stop_calib_stream()
+                    subprocess.run(["systemctl", "--user", "stop", "bt-speaker"], check=False)
                     subprocess.run(["systemctl", "--user", "stop"] + POWER_USER, check=False)
                     subprocess.run(["sudo", "systemctl", "stop"] + POWER_SYSTEM, check=False)
                     self.send_json(200, {"ok": True, "msg": "System gestoppt. Web UI läuft weiter."})
                 else:
                     subprocess.run(["systemctl", "--user", "start"] + POWER_USER, check=False)
                     subprocess.run(["sudo", "systemctl", "start"] + POWER_SYSTEM, check=False)
+                    time.sleep(1.5)
+                    subprocess.run(["systemctl", "--user", "restart", "bt-speaker"], check=False)
                     time.sleep(3)
                     state = load_state()
                     try:

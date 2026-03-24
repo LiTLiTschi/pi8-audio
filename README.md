@@ -46,13 +46,15 @@ sudo chmod 440 /etc/sudoers.d/liu-display
 ### Install
 
 ```bash
-cp bin/display-daemon bin/audio-sync-web ~/bin/
-chmod +x ~/bin/display-daemon ~/bin/audio-sync-web
+cp bin/display-daemon bin/audio-sync-web bin/bt-speaker-init.sh bin/bt-speaker-agent ~/bin/
+chmod +x ~/bin/display-daemon ~/bin/audio-sync-web ~/bin/bt-speaker-init.sh ~/bin/bt-speaker-agent
 cp systemd/*.service ~/.config/systemd/user/
 cp config/display-config.example.json ~/.config/display-config.json
 systemctl --user daemon-reload
-systemctl --user enable --now display-daemon audio-sync-web mpris-proxy
+systemctl --user enable --now bt-speaker display-daemon audio-sync-web mpris-proxy
 ```
+
+Bluetooth visibility depends on **`bt-speaker`**: it runs `discoverable on` / `pairable on` and registers the `bt-speaker-agent` pairing helper. If you restart system **`bluetooth.service`** (Web UI or `sudo systemctl restart bluetooth`), also run `systemctl --user restart bt-speaker` after a second or two, or use **deploy.sh** / restart **`bt-speaker`** so init runs again (BlueZ can return *Busy* immediately after `bluetoothd` restarts).
 
 ### SoundCloud cover art (optional)
 

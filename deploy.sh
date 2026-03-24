@@ -16,12 +16,17 @@ echo "Deploying fb-capture..."
 cp "$REPO/bin/fb-capture" ~/bin/fb-capture
 chmod +x ~/bin/fb-capture
 
+echo "Deploying Bluetooth speaker helper + agent..."
+cp "$REPO/bin/bt-speaker-init.sh" ~/bin/bt-speaker-init.sh
+cp "$REPO/bin/bt-speaker-agent" ~/bin/bt-speaker-agent
+chmod +x ~/bin/bt-speaker-init.sh ~/bin/bt-speaker-agent
+
 echo "Deploying systemd units..."
 cp "$REPO/systemd/"*.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 
 echo "Restarting services..."
-systemctl --user restart display-daemon audio-sync-web mpris-proxy
+systemctl --user restart bt-speaker display-daemon audio-sync-web mpris-proxy
 
 echo "Done. Status:"
-systemctl --user is-active display-daemon audio-sync-web mpris-proxy
+systemctl --user is-active bt-speaker display-daemon audio-sync-web mpris-proxy

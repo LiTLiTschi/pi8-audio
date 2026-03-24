@@ -1,0 +1,15 @@
+[Unit]
+Description=Bluetooth A2DP speaker setup (discoverable + pairing agent)
+After=bluetooth.service bluetooth.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+# Init must tolerate org.bluez.Error.Busy right after bluetoothd restart (see bt-speaker-init.sh).
+ExecStartPre=%h/bin/bt-speaker-init.sh
+ExecStart=%h/bin/bt-speaker-agent
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
