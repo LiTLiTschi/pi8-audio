@@ -713,7 +713,9 @@ def _preset_scheduler():
                 load_preset(name)
         except Exception as e:
             print(f"[scheduler] error: {e}")
-        time.sleep(60)
+        now = time.time()
+        sleep_secs = 60 - (now % 60) + 0.5  # wake 0.5s into next minute
+        time.sleep(sleep_secs)
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -2834,6 +2836,10 @@ _sleep_timer_lock = threading.Lock()
 
 _last_schedule_fire: dict = {}  # preset_name → "YYYY-MM-DD HH:MM" of last fire
 
+_buffers_lock = threading.Lock()
+_buffers_cache: dict = {"ts": 0, "data": None}
+BUFFERS_CACHE_TTL = 10  # seconds
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -3036,18 +3042,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if self.path == "/buffers":
-            front_buf = int(data.get("front", 2048))
-            rear_buf  = int(data.get("rear", 512))
-            with _apply_lock:
-                state = load_state()
-                state["buffer_front"] = front_buf
-                state["buffer_rear"]  = rear_buf
-                save_state(state)
-                apply_buffers(front_buf, rear_buf)
-                subprocess.run(["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"], check=False)
-                time.sleep(3)
-                apply_state(state)
-            self.send_json(200, {"ok": True, "msg": f"Buffer: Front={front_buf}, Rear={rear_buf}. PipeWire neu gestartet."})
+            now = time.time()
+            if _buffers_cache["data"] and now - _buffers_cache["ts"] < BUFFERS_CACHE_TTL:
+                self.send_json(200, _buffers_cache["data"])
+                return
+            if not _buffers_lock.acquire(blocking=False):
+                # scan in progress, return stale cache or empty
+                self.send_json(200, _buffers_cache["data"] or {})
+                return
+            try:
+                front_buf = int(data.get("front", 2048))
+                rear_buf  = int(data.get("rear", 512))
+                with _apply_lock:
+                    state = load_state()
+                    state["buffer_front"] = front_buf
+                    state["buffer_rear"]  = rear_buf
+                    save_state(state)
+                    apply_buffers(front_buf, rear_buf)
+                    subprocess.run(["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"], check=False)
+                    time.sleep(3)
+                    apply_state(state)
+                result = {"ok": True, "msg": f"Buffer: Front={front_buf}, Rear={rear_buf}. PipeWire neu gestartet."}
+                _buffers_cache["data"] = result
+                _buffers_cache["ts"] = time.time()
+                self.send_json(200, result)
+            finally:
+                _buffers_lock.release()
             return
 
         if self.path == "/restart-service":
@@ -3241,7 +3261,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {**get_master_volume(), "ok": True})
                 return
             vol = int(data.get("volume", 50))
-            vol = max(0, min(150, vol))
+            vol = max(0, min(100, vol))
             try:
                 set_master_volume(vol)
             except subprocess.CalledProcessError as e:
@@ -3317,6 +3337,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         if self.path == "/apply":
+            target   = data.get("target")   # "front" | "rear" | None
+            delay_ms = float(data.get("delay_ms", 0))
+
+            if target not in (None, "front", "rear"):
+                self.send_json(400, {"ok": False, "msg": "invalid target"})
+                return
+            if delay_ms < 0 or delay_ms > 500:
+                self.send_json(400, {"ok": False, "msg": "delay out of range (0–500ms)"})
+                return
+
             with _apply_status_lock:
                 if _apply_status["state"] == "applying":
                     self.send_json(409, {"ok": False, "error": "already applying"})
