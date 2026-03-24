@@ -56,6 +56,8 @@ systemctl --user enable --now bt-speaker display-daemon audio-sync-web mpris-pro
 
 Bluetooth visibility depends on **`bt-speaker`**: it runs `discoverable on` / `pairable on` and registers the `bt-speaker-agent` pairing helper. If you restart system **`bluetooth.service`** (Web UI or `sudo systemctl restart bluetooth`), also run `systemctl --user restart bt-speaker` after a second or two, or use **deploy.sh** / restart **`bt-speaker`** so init runs again (BlueZ can return *Busy* immediately after `bluetoothd` restarts).
 
+The adapter **friendly name** comes from BlueZ’s hostname plugin (`PRETTY_HOSTNAME` in **`/etc/machine-info`**) and a persisted **alias** under **`/var/lib/bluetooth/<adapter>/settings`**. `bt-speaker-init.sh` sets **`bluetoothctl system-alias`** to the **static hostname** (`hostnamectl --static`) so the radio name stays **`pi8`** (or whatever `/etc/hostname` is) and does not stick on an old value.
+
 ### SoundCloud cover art (optional)
 
 Register a free app at https://soundcloud.com/you/apps, then:
