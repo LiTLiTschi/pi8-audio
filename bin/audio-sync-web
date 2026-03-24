@@ -1308,6 +1308,34 @@ HTML = """\
     </div>
   </details>
 
+  <details id="test-panel" style="margin-top:1rem;border:1px solid #333;border-radius:6px">
+    <summary style="padding:0.6rem 1rem;background:#1a1a1a;cursor:pointer;
+                    display:flex;justify-content:space-between;align-items:center;
+                    border-radius:6px;user-select:none">
+      <span>🧪 Test / Debug</span>
+      <span style="font-size:0.75rem;color:#555">▼</span>
+    </summary>
+    <div style="padding:1rem">
+      <div style="display:grid;gap:0.4rem;margin-bottom:0.8rem">
+        <input id="sim-title"  placeholder="Title"  style="background:#111;border:1px solid #333;color:#eee;padding:0.3rem 0.5rem;border-radius:4px">
+        <input id="sim-artist" placeholder="Artist" style="background:#111;border:1px solid #333;color:#eee;padding:0.3rem 0.5rem;border-radius:4px">
+        <input id="sim-album"  placeholder="Album"  style="background:#111;border:1px solid #333;color:#eee;padding:0.3rem 0.5rem;border-radius:4px">
+      </div>
+      <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-bottom:0.8rem">
+        <button onclick="simMeta()"    style="padding:0.35rem 0.7rem;background:#222;border:1px solid #444;border-radius:4px;color:#ccc;cursor:pointer">▶ Inject Track</button>
+        <button onclick="simStatus('Playing')"  style="padding:0.35rem 0.7rem;background:#222;border:1px solid #444;border-radius:4px;color:#ccc;cursor:pointer">Playing</button>
+        <button onclick="simStatus('Paused')"   style="padding:0.35rem 0.7rem;background:#222;border:1px solid #444;border-radius:4px;color:#ccc;cursor:pointer">Paused</button>
+        <button onclick="simStatus('Stopped')"  style="padding:0.35rem 0.7rem;background:#222;border:1px solid #444;border-radius:4px;color:#ccc;cursor:pointer">Stopped</button>
+      </div>
+      <!-- Live display frame preview -->
+      <div id="test-preview-wrap" style="display:none">
+        <div style="font-size:0.75rem;color:#555;margin-bottom:0.3rem">Display preview (auto-refresh 3s)</div>
+        <img id="test-frame-img" src="" style="width:100%;border-radius:4px;border:1px solid #333;display:block">
+      </div>
+      <div id="test-status" style="font-size:0.8rem;color:#777;margin-top:0.5rem"></div>
+    </div>
+  </details>
+
   <details id="history-panel" style="margin-top:1rem;border:1px solid #333;border-radius:8px;overflow:hidden">
     <summary style="padding:0.75rem 1rem;background:#1a1a1a;cursor:pointer;font-size:0.9rem;color:#aaa;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
       <span>📋 History</span>
@@ -2573,6 +2601,56 @@ setInterval(() => {
   if (_volDragging) return;
   fetch('/volume').then(r => r.json()).then(d => updateVolUI(d.volume, d.muted));
 }, 5000);
+
+let _testPreviewTimer = null;
+
+async function simMeta() {
+  const body = {
+    type: 'metadata',
+    title:  document.getElementById('sim-title').value,
+    artist: document.getElementById('sim-artist').value,
+    album:  document.getElementById('sim-album').value,
+  };
+  try {
+    const r = await fetch('/simulate', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    document.getElementById('test-status').textContent =
+      d.ok ? `✓ MetadataEvent injected` : `✗ ${d.msg || d.error}`;
+    refreshTestFrame();
+  } catch(e) {
+    document.getElementById('test-status').textContent = '✗ ' + e.message;
+  }
+}
+
+async function simStatus(status) {
+  try {
+    const r = await fetch('/simulate', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({type: 'status', status})});
+    const d = await r.json();
+    document.getElementById('test-status').textContent =
+      d.ok ? `✓ StatusEvent(${status}) injected` : `✗ ${d.msg || d.error}`;
+  } catch(e) {
+    document.getElementById('test-status').textContent = '✗ ' + e.message;
+  }
+}
+
+function refreshTestFrame() {
+  const img = document.getElementById('test-frame-img');
+  img.src = '/display-frame?t=' + Date.now();
+  document.getElementById('test-preview-wrap').style.display = '';
+}
+
+// Poll display frame while test panel is open
+document.getElementById('test-panel').addEventListener('toggle', e => {
+  if (e.target.open) {
+    refreshTestFrame();
+    _testPreviewTimer = setInterval(refreshTestFrame, 3000);
+  } else {
+    clearInterval(_testPreviewTimer);
+  }
+});
 </script>
 </body>
 </html>
@@ -2923,6 +3001,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _sleep_timer_lock:
                 remaining = max(0.0, _sleep_timer_end - time.time()) if _sleep_timer else 0.0
             self.send_json(200, {"active": _sleep_timer is not None, "remaining_seconds": int(remaining)})
+        elif self.path == "/display-frame":
+            try:
+                with urllib.request.urlopen("http://localhost:8084/frame", timeout=2) as r:
+                    data = r.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", len(data))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self.send_response(503); self.end_headers()
         else:
             body = HTML.encode()
             self.send_response(200)
@@ -2932,6 +3022,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_POST(self):
+        if self.path == "/simulate":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                req = urllib.request.Request("http://localhost:8084/simulate",
+                      data=body, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=2) as r:
+                    self.send_json(r.getcode(), json.loads(r.read()))
+            except Exception as e:
+                self.send_json(502, {"ok": False, "msg": str(e)})
+            return
         if self.path not in ("/apply", "/balance", "/mode", "/volume", "/player", "/debug-volume", "/debug-test", "/source", "/network-config", "/buffers", "/restart-service", "/play-sync-test", "/calib-stream", "/presets", "/presets/load", "/presets/delete", "/hdmi", "/power", "/display", "/sleep-timer"):
             self.send_json(404, {"ok": False, "msg": "not found"})
             return

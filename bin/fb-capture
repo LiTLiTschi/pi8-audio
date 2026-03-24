@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Capture /dev/fb0 → PNG. Usage: fb-capture [output.png]"""
+import sys, mmap, os
+from PIL import Image
+
+def main():
+    out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/fb-capture.png"
+    vsize = open("/sys/class/graphics/fb0/virtual_size").read().strip()
+    bpp   = int(open("/sys/class/graphics/fb0/bits_per_pixel").read())
+    w, h  = map(int, vsize.split(","))
+    bpp_bytes = bpp // 8
+    fd = os.open("/dev/fb0", os.O_RDONLY)
+    mm = mmap.mmap(fd, 0, mmap.MAP_PRIVATE, mmap.PROT_READ)
+    os.close(fd)
+    data = mm.read(w * h * bpp_bytes)
+    mm.close()
+    if bpp_bytes == 2:
+        import numpy as np
+        arr = np.frombuffer(data, dtype=np.uint16).reshape(h, w)
+        r = ((arr >> 11) & 0x1F) * 255 // 31
+        g = ((arr >> 5)  & 0x3F) * 255 // 63
+        b = (arr & 0x1F) * 255 // 31
+        rgb = np.stack([r, g, b], axis=2).astype(np.uint8)
+        img = Image.fromarray(rgb, "RGB")
+    elif bpp_bytes == 4:
+        img = Image.frombytes("RGBA", (w, h), data)
+        b, g, r, a = img.split()
+        img = Image.merge("RGB", (r, g, b))
+    else:
+        img = Image.frombytes("RGB", (w, h), data)
+    img.save(out)
+    print(f"Saved {w}x{h} ({bpp}bpp) → {out}")
+
+if __name__ == "__main__":
+    main()

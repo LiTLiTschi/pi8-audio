@@ -12,6 +12,10 @@ echo "Deploying audio-sync-web..."
 cp "$REPO/bin/audio-sync-web" ~/bin/audio-sync-web
 chmod +x ~/bin/audio-sync-web
 
+echo "Deploying fb-capture..."
+cp "$REPO/bin/fb-capture" ~/bin/fb-capture
+chmod +x ~/bin/fb-capture
+
 echo "Deploying systemd units..."
 cp "$REPO/systemd/"*.service ~/.config/systemd/user/
 systemctl --user daemon-reload
