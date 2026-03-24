@@ -99,12 +99,15 @@ def save_state(s):
 
 
 # ── Online cover art lookup ────────────────────────────────────────────────────
-_art_cache: dict = {}   # key: (artist, title) → url or ""
+import collections as _collections
+_art_cache: _collections.OrderedDict = _collections.OrderedDict()
+_ART_CACHE_MAX = 500
 
 def get_cover_art(artist: str, title: str, album: str = "") -> str:
     """Fetch cover art URL. Tries SoundCloud → Deezer → iTunes. Returns "" on failure."""
     key = (artist.lower(), title.lower())
     if key in _art_cache:
+        _art_cache.move_to_end(key)
         return _art_cache[key]
 
     url = (_sc_cover(artist, title)
@@ -112,6 +115,9 @@ def get_cover_art(artist: str, title: str, album: str = "") -> str:
            or _itunes_cover(artist, title))
 
     _art_cache[key] = url or ""
+    _art_cache.move_to_end(key)
+    if len(_art_cache) > _ART_CACHE_MAX:
+        _art_cache.popitem(last=False)
     if url:
         log.info("cover art found for %r — %r", artist, title)
     else:
@@ -241,17 +247,14 @@ def fb_clear(fb_mm, w, h, bpp_bytes):
 
 
 # ── mpv IPC helpers ───────────────────────────────────────────────────────────
-def _mpv_send(cmd):
+def _mpv_send(cmd: list):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2.0)
         s.connect(MPV_SOCK)
         s.sendall(json.dumps({"command": cmd}).encode() + b"\n")
-        resp = s.recv(4096)
+        return json.loads(s.recv(4096))
+    finally:
         s.close()
-        return json.loads(resp) if resp else {}
-    except Exception:
-        return {}
 
 def mpv_loadfile(path_or_url):
     _mpv_send(["loadfile", path_or_url, "replace"])
@@ -262,12 +265,19 @@ def mpv_stop():
 def mpv_quit():
     _mpv_send(["quit"])
 
-def mpv_wait_ready(timeout=5.0):
+def mpv_wait_ready(timeout=10.0):
+    """Poll until mpv IPC socket accepts connections."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(MPV_SOCK):
-            time.sleep(0.3)   # give mpv a moment to finish binding
-            return True
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                s.connect(MPV_SOCK)
+                s.close()
+                return True
+            except OSError:
+                pass
         time.sleep(0.1)
     return False
 
@@ -278,27 +288,27 @@ def mpv_wait_end_file():
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.5)
         s.connect(MPV_SOCK)
-        buf = b""
-        while True:
-            if not _queue.empty():
-                s.close()
-                return False
-            try:
-                chunk = s.recv(4096)
-                if not chunk:
-                    s.close()
-                    return True
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    try:
-                        if json.loads(line).get("event") == "end-file":
-                            s.close()
-                            return True
-                    except Exception:
-                        pass
-            except socket.timeout:
-                pass
+        try:
+            buf = b""
+            while True:
+                if not _queue.empty():
+                    return False
+                try:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        return True
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        try:
+                            if json.loads(line).get("event") == "end-file":
+                                return True
+                        except Exception:
+                            pass
+                except socket.timeout:
+                    pass
+        finally:
+            s.close()
     except Exception:
         return True
 
@@ -321,6 +331,9 @@ def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album=""):
         except Exception:
             log.warning("cover art download failed: %s", resolved_url)
             _cover_cache[0] = None
+            _last_art_url[0] = ""
+            key = (artist.lower(), title.lower())
+            _art_cache.pop(key, None)
 
     cover = _cover_cache[0]
     frame = (gradient_from_artist(artist, W, H)
@@ -413,10 +426,14 @@ def find_video_url(artist, title):
         r = subprocess.run(
             ["yt-dlp", "--no-playlist", "--print", "url", "--quiet",
              f"ytsearch1:{artist} {title} official music video"],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=30)
         lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
         return lines[0] if lines else None
-    except Exception:
+    except subprocess.TimeoutExpired:
+        log.warning("yt-dlp search timed out for %r — %r", artist, title)
+        return None
+    except Exception as e:
+        log.debug("yt-dlp error: %s", e)
         return None
 
 
@@ -485,6 +502,8 @@ def display_controller():
     cava_proc    = [None]
     fb_mm        = [None]
     fb_bpp       = [4]
+    fb_W         = [W]
+    fb_H         = [H]
     vis_stop     = threading.Event()
     current_mode = "off"
     old_frame    = [None]
@@ -500,8 +519,10 @@ def display_controller():
         connector, _, _ = detect_connector()
         # mpv expects short name e.g. "HDMI-A-2", not sysfs name "card1-HDMI-A-2"
         mpv_connector = connector.split("-", 1)[1]
-        subprocess.run(["pkill", "-f", MPV_SOCK], stderr=subprocess.DEVNULL)
-        time.sleep(0.3)
+        if mpv_proc[0] and mpv_proc[0].poll() is None:
+            mpv_proc[0].terminate()
+            try: mpv_proc[0].wait(timeout=3)
+            except subprocess.TimeoutExpired: mpv_proc[0].kill()
         Image.new("RGB", (W, H), (0,0,0)).save(NP_FILE)
         mpv_proc[0] = subprocess.Popen(
             ["mpv", "--vo=drm", f"--drm-connector={mpv_connector}", "--fullscreen",
@@ -527,6 +548,8 @@ def display_controller():
         try:
             _fw, _fh, bpp = fb_detect()
             fb_bpp[0] = bpp
+            fb_W[0] = _fw
+            fb_H[0] = _fh
             fd = os.open("/dev/fb0", os.O_RDWR)
             fb_mm[0] = mmap.mmap(fd, 0)
             os.close(fd)
@@ -540,7 +563,7 @@ def display_controller():
     def close_fb():
         if fb_mm[0]:
             try:
-                fb_clear(fb_mm[0], W, H, fb_bpp[0])
+                fb_clear(fb_mm[0], fb_W[0], fb_H[0], fb_bpp[0])
                 fb_mm[0].close()
             except Exception: pass
             fb_mm[0] = None
@@ -569,8 +592,9 @@ def display_controller():
                     vals = [int(x) for x in line.strip().split(";") if x.strip()]
                 except Exception: continue
                 if not vals: continue
-                mirror = _state.get("visualizer_mirror", False)
-                img = render_vis_frame(vals, W, H, mirror)
+                with _lock:
+                    mirror = _state.get("visualizer_mirror", False)
+                img = render_vis_frame(vals, fb_W[0], fb_H[0], mirror)
                 if fb_mm[0]: fb_write(fb_mm[0], img, fb_bpp[0])
             cava_proc[0].wait()
 
@@ -617,16 +641,24 @@ def display_controller():
         return True
 
     # ── now-playing render ─────────────────────────────────────────────────────
+    _rendering = [False]
+
     def do_render(ev):
-        overlay = _state.get("overlay_enabled", True)
-        log.info("render: %r — %r (artUrl=%s)", ev.title, ev.artist, "yes" if ev.artUrl else "no")
-        new_frame = render_now_playing(ev.title, ev.artist, ev.artUrl, overlay, W, H,
-                                       album=getattr(ev, "album", ""))
-        crossfade_to(old_frame[0], new_frame, W, H)
-        old_frame[0] = new_frame
-        with _lock:
-            _track.update(title=ev.title, artist=ev.artist, artUrl=ev.artUrl)
-            _g["status"] = "playing" if (ev.title or ev.artist) else "idle"
+        if _rendering[0]:
+            return
+        _rendering[0] = True
+        try:
+            overlay = _state.get("overlay_enabled", True)
+            log.info("render: %r — %r (artUrl=%s)", ev.title, ev.artist, "yes" if ev.artUrl else "no")
+            new_frame = render_now_playing(ev.title, ev.artist, ev.artUrl, overlay, W, H,
+                                           album=getattr(ev, "album", ""))
+            crossfade_to(old_frame[0], new_frame, W, H)
+            old_frame[0] = new_frame
+            with _lock:
+                _track.update(title=ev.title, artist=ev.artist, artUrl=ev.artUrl)
+                _g["status"] = "playing" if (ev.title or ev.artist) else "idle"
+        finally:
+            _rendering[0] = False
 
     # ── music video handler ────────────────────────────────────────────────────
     def handle_video(ev):
@@ -682,6 +714,10 @@ def display_controller():
             ev = _queue.get(timeout=1.0)
         except queue.Empty:
             continue
+
+        if ev is None:
+            teardown(current_mode)
+            return
 
         if isinstance(ev, ModeChangeEvent):
             new_mode = ev.mode
@@ -776,7 +812,8 @@ if __name__ == "__main__":
         for k in ("mode", "overlay_enabled", "visualizer_mirror"):
             if k in saved: _state[k] = saved[k]
 
-    subprocess.run(["pkill", "-f", MPV_SOCK], stderr=subprocess.DEVNULL)
+    try: os.unlink(MPV_SOCK)
+    except FileNotFoundError: pass
 
     for fn in (mpris_metadata_watcher, mpris_status_watcher, display_controller):
         threading.Thread(target=fn, daemon=True).start()
@@ -787,6 +824,16 @@ if __name__ == "__main__":
         ev = ModeChangeEvent(_state["mode"], _state["overlay_enabled"],
                              _state["visualizer_mirror"])
     _queue.put(ev)
+
+    import signal
+
+    def _shutdown(signum, frame):
+        log.info("shutdown signal %d — tearing down", signum)
+        _queue.put(None)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"display-daemon → localhost:{PORT}")
