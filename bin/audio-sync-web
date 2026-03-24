@@ -469,8 +469,11 @@ def apply_state(state):
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass  # corrupt or empty file — fall through to defaults
     return {"target": None, "delay_ms": 0, "balance": 0, "mode": "stereo", "source": "bluetooth"}
 
 

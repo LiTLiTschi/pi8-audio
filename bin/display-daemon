@@ -539,14 +539,16 @@ def crossfade_to(old_frame, new_frame, W, H):
         p = f"{CF_DIR}/frame-{i:02d}.png"
         blend.save(p)
         paths.append(p)
-    for p in paths:
-        mpv_loadfile(p)
-        time.sleep(1 / 30)
-    new_frame.save(NP_FILE)
-    mpv_loadfile(NP_FILE, loop=True)
-    for p in paths:
-        try: os.unlink(p)
-        except Exception: pass
+    try:
+        for p in paths:
+            mpv_loadfile(p)
+            time.sleep(1 / 30)
+        new_frame.save(NP_FILE)
+        mpv_loadfile(NP_FILE, loop=True)
+    finally:
+        for p in paths:
+            try: os.unlink(p)
+            except Exception: pass
 
 
 # ── Visualizer frame ──────────────────────────────────────────────────────────
@@ -1100,18 +1102,22 @@ def bt_connect_watcher():
                     log.info("BT player connected — auto-switching to now-playing")
                     with _lock:
                         _state["mode"] = "now-playing"
-                    save_state(dict(_state))
-                    _queue.put(ModeChangeEvent("now-playing",
-                                               _state.get("overlay_enabled", True),
-                                               _state.get("visualizer_mirror", False)))
+                        ev = ModeChangeEvent("now-playing",
+                                             _state.get("overlay_enabled", True),
+                                             _state.get("visualizer_mirror", False))
+                        state_snap = dict(_state)
+                    save_state(state_snap)
+                    _queue.put(ev)
                 elif not now_present and mode == "now-playing":
                     log.info("BT player disconnected — auto-switching to off")
                     with _lock:
                         _state["mode"] = "off"
-                    save_state(dict(_state))
-                    _queue.put(ModeChangeEvent("off",
-                                               _state.get("overlay_enabled", True),
-                                               _state.get("visualizer_mirror", False)))
+                        ev = ModeChangeEvent("off",
+                                             _state.get("overlay_enabled", True),
+                                             _state.get("visualizer_mirror", False))
+                        state_snap = dict(_state)
+                    save_state(state_snap)
+                    _queue.put(ev)
         except Exception as e:
             log.debug("bt_connect_watcher error: %s", e)
         time.sleep(5)
