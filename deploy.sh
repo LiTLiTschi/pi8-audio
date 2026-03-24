@@ -21,6 +21,11 @@ cp "$REPO/bin/bt-speaker-init.sh" ~/bin/bt-speaker-init.sh
 cp "$REPO/bin/bt-speaker-agent" ~/bin/bt-speaker-agent
 chmod +x ~/bin/bt-speaker-init.sh ~/bin/bt-speaker-agent
 
+echo "Deploying D-Bus policy for PipeWire/WirePlumber ↔ BlueZ (requires sudo)..."
+sudo cp "$REPO/config/dbus-zz-pi8-bluetooth-wireplumber-policy.conf" \
+  /etc/dbus-1/system.d/zz-pi8-bluetooth-wireplumber-policy.conf
+sudo systemctl reload dbus
+
 echo "Deploying systemd units..."
 cp "$REPO/systemd/"*.service ~/.config/systemd/user/
 systemctl --user daemon-reload

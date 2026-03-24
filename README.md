@@ -58,6 +58,8 @@ Bluetooth visibility depends on **`bt-speaker`**: it runs `discoverable on` / `p
 
 The adapter **friendly name** comes from BlueZ’s hostname plugin (`PRETTY_HOSTNAME` in **`/etc/machine-info`**) and a persisted **alias** under **`/var/lib/bluetooth/<adapter>/settings`**. `bt-speaker-init.sh` sets **`bluetoothctl system-alias`** to the **static hostname** (`hostnamectl --static`) so the radio name stays **`pi8`** (or whatever `/etc/hostname` is) and does not stick on an old value.
 
+**D-Bus / A2DP:** If the phone sees **pi8** but **cannot connect**, check `journalctl` for `Rejected send message ... MediaEndpoint1.Error.NotImplemented` (WirePlumber vs `bluetoothd`). Ubuntu’s default bus policy only allows those replies when `send_requested_reply=true`; PipeWire often sends `requested_reply=0`. Install **`config/dbus-zz-pi8-bluetooth-wireplumber-policy.conf`** as **`/etc/dbus-1/system.d/zz-pi8-bluetooth-wireplumber-policy.conf`** and run **`sudo systemctl reload dbus`**, then restart **`bluetooth`** and user **`pipewire`** / **`wireplumber`**. **`deploy.sh`** does this for you (uses `sudo`).
+
 ### SoundCloud cover art (optional)
 
 Register a free app at https://soundcloud.com/you/apps, then:
