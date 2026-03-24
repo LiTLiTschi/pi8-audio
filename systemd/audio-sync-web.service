@@ -1,0 +1,12 @@
+[Unit]
+Description=Audio Sync Web UI (port 7700)
+After=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/liu/bin/audio-sync-web
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

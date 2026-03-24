@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+"""HDMI Display Daemon — controls what appears on the connected HDMI screen.
+Modes: off (TTY) | now-playing (cover art) | visualizer (cava bars) | music-video (yt-dlp)
+HTTP API on localhost:8084 — proxied by audio-sync-web.
+"""
+
+import colorsys
+import hashlib
+import http.server
+import json
+import logging
+import mmap
+import os
+import queue
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("display-daemon")
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+STATE_FILE = Path.home() / ".config/display-state.json"
+DISPLAY_CONFIG_FILE = Path.home() / ".config/display-config.json"
+
+def load_display_config():
+    try:
+        return json.loads(DISPLAY_CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+
+_display_config = load_display_config()
+COVER_FILE = "/tmp/display-cover.jpg"
+NP_FILE    = "/tmp/now-playing.png"
+CF_DIR     = "/tmp/cf"
+MPV_SOCK   = "/tmp/mpv-display.sock"
+CAVA_CONF  = "/tmp/cava-display.conf"
+FONT_REG   = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
+FONT_BOLD  = "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"
+PORT       = 8084
+
+# ── Shared mutable state (all protected by _lock) ────────────────────────────
+_lock   = threading.Lock()
+_state  = {"mode": "off", "overlay_enabled": True, "visualizer_mirror": False}
+_track  = {"title": "", "artist": "", "artUrl": ""}
+_g      = {"status": "idle"}   # volatile string; use dict to avoid global rebind issues
+_queue  : queue.Queue = queue.Queue()
+
+
+# ── Event types ───────────────────────────────────────────────────────────────
+class MetadataEvent:
+    __slots__ = ("title", "artist", "artUrl", "album")
+    def __init__(self, title, artist, artUrl, album=""):
+        self.title  = title
+        self.artist = artist
+        self.artUrl = artUrl
+        self.album  = album
+
+class StatusEvent:
+    __slots__ = ("status",)
+    def __init__(self, status):
+        self.status = status   # "Playing" | "Paused" | "Stopped"
+
+class ModeChangeEvent:
+    __slots__ = ("mode", "overlay_enabled", "visualizer_mirror")
+    def __init__(self, mode, overlay_enabled, visualizer_mirror):
+        self.mode              = mode
+        self.overlay_enabled   = overlay_enabled
+        self.visualizer_mirror = visualizer_mirror
+
+
+# ── State persistence ─────────────────────────────────────────────────────────
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_state(s):
+    try:
+        STATE_FILE.write_text(json.dumps(s, indent=2))
+    except Exception:
+        pass
+
+
+# ── Online cover art lookup ────────────────────────────────────────────────────
+_art_cache: dict = {}   # key: (artist, title) → url or ""
+
+def get_cover_art(artist: str, title: str, album: str = "") -> str:
+    """Fetch cover art URL. Tries SoundCloud → Deezer → iTunes. Returns "" on failure."""
+    key = (artist.lower(), title.lower())
+    if key in _art_cache:
+        return _art_cache[key]
+
+    url = (_sc_cover(artist, title)
+           or _deezer_cover(artist, title)
+           or _itunes_cover(artist, title))
+
+    _art_cache[key] = url or ""
+    if url:
+        log.info("cover art found for %r — %r", artist, title)
+    else:
+        log.info("no cover art found for %r — %r (will use gradient)", artist, title)
+    return _art_cache[key]
+
+
+def _sc_cover(artist: str, title: str) -> str:
+    client_id = _display_config.get("soundcloud_client_id", "")
+    if not client_id:
+        return ""
+    try:
+        q = urllib.parse.quote(f"{artist} {title}")
+        req = urllib.request.Request(
+            f"https://api.soundcloud.com/tracks?q={q}&client_id={client_id}&limit=3",
+            headers={"User-Agent": "display-daemon/2.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        for track in data:
+            art = track.get("artwork_url") or track.get("user", {}).get("avatar_url", "")
+            if art:
+                return art.replace("large", "t500x500")
+    except Exception as e:
+        log.debug("SoundCloud lookup failed: %s", e)
+    return ""
+
+
+def _deezer_cover(artist: str, title: str) -> str:
+    try:
+        q = urllib.parse.quote(f"{artist} {title}")
+        req = urllib.request.Request(
+            f"https://api.deezer.com/search?q={q}&limit=5",
+            headers={"User-Agent": "display-daemon/2.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        for item in data.get("data", []):
+            album = item.get("album", {})
+            url = album.get("cover_xl") or album.get("cover_big") or album.get("cover_medium")
+            if url:
+                return url
+    except Exception as e:
+        log.debug("Deezer lookup failed: %s", e)
+    return ""
+
+
+def _itunes_cover(artist: str, title: str) -> str:
+    try:
+        q = urllib.parse.quote(f"{artist} {title}")
+        req = urllib.request.Request(
+            f"https://itunes.apple.com/search?term={q}&entity=musicTrack&limit=1",
+            headers={"User-Agent": "display-daemon/2.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        results = data.get("results", [])
+        if results:
+            art = results[0].get("artworkUrl100", "")
+            if art:
+                return art.replace("100x100bb.jpg", "600x600bb.jpg")
+    except Exception as e:
+        log.debug("iTunes lookup failed: %s", e)
+    return ""
+
+
+def gradient_from_artist(artist: str, W: int, H: int) -> "Image.Image":
+    """Generate a deterministic vertical gradient from artist name hash."""
+    import numpy as np
+    h = int(hashlib.md5(artist.encode() or b"unknown").hexdigest()[:8], 16)
+    hue1 = (h & 0xFF) / 255.0
+    hue2 = ((h >> 8) & 0xFF) / 255.0
+    rgb1 = tuple(int(x * 255) for x in colorsys.hsv_to_rgb(hue1, 0.65, 0.30))
+    rgb2 = tuple(int(x * 255) for x in colorsys.hsv_to_rgb(hue2, 0.75, 0.50))
+    t = np.linspace(0, 1, H, dtype=np.float32)[:, None]
+    arr = (np.array(rgb1, dtype=np.float32) * (1 - t)
+           + np.array(rgb2, dtype=np.float32) * t)
+    arr = np.broadcast_to(arr[:, None, :], (H, W, 3)).astype(np.uint8).copy()
+    return Image.fromarray(arr, "RGB")
+
+
+# ── Screen / framebuffer detection ────────────────────────────────────────────
+def detect_connector():
+    """Return (connector_name, width, height) for the first connected HDMI output."""
+    for connector in ["card1-HDMI-A-1", "card1-HDMI-A-2",
+                      "card0-HDMI-A-1", "card0-HDMI-A-2"]:
+        try:
+            status = open(f"/sys/class/drm/{connector}/status").read().strip()
+            if status != "connected":
+                continue
+            line = open(f"/sys/class/drm/{connector}/modes").readline().strip()
+            if line:
+                w, h = line.split("x")
+                return connector, int(w), int(h)
+        except Exception:
+            pass
+    return "card1-HDMI-A-2", 1920, 1080
+
+def detect_screen_size():
+    _, w, h = detect_connector()
+    return w, h
+
+def fb_detect():
+    """Returns (width, height, bytes_per_pixel)."""
+    vsize = open("/sys/class/graphics/fb0/virtual_size").read().strip()
+    bpp   = int(open("/sys/class/graphics/fb0/bits_per_pixel").read())
+    w, h  = map(int, vsize.split(","))
+    return w, h, bpp // 8
+
+def fb_write(fb_mm, img, bpp_bytes):
+    """Write PIL RGB image to framebuffer mmap."""
+    if bpp_bytes == 2:  # RGB565 (Pi4 default)
+        import numpy as np
+        arr = np.array(img.convert("RGB"), dtype=np.uint8)
+        r = arr[:, :, 0].astype(np.uint16) >> 3
+        g = arr[:, :, 1].astype(np.uint16) >> 2
+        b = arr[:, :, 2].astype(np.uint16) >> 3
+        rgb565 = ((r << 11) | (g << 5) | b).astype(np.uint16)
+        fb_mm.seek(0)
+        fb_mm.write(rgb565.tobytes())
+    elif bpp_bytes == 4:  # BGRA
+        r, g, b, a = img.convert("RGBA").split()
+        img = Image.merge("RGBA", (b, g, r, a))
+        fb_mm.seek(0)
+        fb_mm.write(img.tobytes())
+    else:
+        fb_mm.seek(0)
+        fb_mm.write(img.convert("RGB").tobytes())
+
+def fb_clear(fb_mm, w, h, bpp_bytes):
+    fb_mm.seek(0)
+    fb_mm.write(b"\x00" * (w * h * bpp_bytes))
+
+
+# ── mpv IPC helpers ───────────────────────────────────────────────────────────
+def _mpv_send(cmd):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(MPV_SOCK)
+        s.sendall(json.dumps({"command": cmd}).encode() + b"\n")
+        resp = s.recv(4096)
+        s.close()
+        return json.loads(resp) if resp else {}
+    except Exception:
+        return {}
+
+def mpv_loadfile(path_or_url):
+    _mpv_send(["loadfile", path_or_url, "replace"])
+
+def mpv_stop():
+    _mpv_send(["stop"])
+
+def mpv_quit():
+    _mpv_send(["quit"])
+
+def mpv_wait_ready(timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(MPV_SOCK):
+            time.sleep(0.3)   # give mpv a moment to finish binding
+            return True
+        time.sleep(0.1)
+    return False
+
+def mpv_wait_end_file():
+    """Block until mpv fires end-file event or queue has a new item.
+    Returns True = video ended normally, False = interrupted."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(MPV_SOCK)
+        buf = b""
+        while True:
+            if not _queue.empty():
+                s.close()
+                return False
+            try:
+                chunk = s.recv(4096)
+                if not chunk:
+                    s.close()
+                    return True
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        if json.loads(line).get("event") == "end-file":
+                            s.close()
+                            return True
+                    except Exception:
+                        pass
+            except socket.timeout:
+                pass
+    except Exception:
+        return True
+
+
+# ── Pillow: now-playing frame ─────────────────────────────────────────────────
+_cover_cache  = [None]
+_last_art_url = [""]
+
+def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album=""):
+    # Resolve cover art: MPRIS artUrl → online lookup → None
+    resolved_url = artUrl
+    if not resolved_url and (artist or title):
+        resolved_url = get_cover_art(artist, title, album)
+
+    if resolved_url and resolved_url != _last_art_url[0]:
+        try:
+            urllib.request.urlretrieve(resolved_url, COVER_FILE)
+            _cover_cache[0] = Image.open(COVER_FILE).convert("RGB")
+            _last_art_url[0] = resolved_url
+        except Exception:
+            log.warning("cover art download failed: %s", resolved_url)
+            _cover_cache[0] = None
+
+    cover = _cover_cache[0]
+    frame = (gradient_from_artist(artist, W, H)
+             if (not _cover_cache[0] and (artist or title))
+             else Image.new("RGB", (W, H), (0, 0, 0)))
+
+    if cover:
+        # Layer 1: blurred fill background
+        bg = cover.resize((W, H), Image.LANCZOS)
+        bg = bg.filter(ImageFilter.GaussianBlur(radius=40))
+        frame.paste(Image.blend(bg, Image.new("RGB", (W, H), (0,0,0)), 0.5), (0, 0))
+
+        # Layer 2: sharp centred art + drop shadow
+        art_h = int(H * 0.55)
+        art_w = int(cover.width * art_h / cover.height)
+        art   = cover.resize((art_w, art_h), Image.LANCZOS)
+        ax = (W - art_w) // 2
+        ay = (H - art_h) // 2 - int(H * 0.05)
+
+        shd = Image.new("RGBA", (art_w + 40, art_h + 40), (0, 0, 0, 0))
+        shd.paste((0, 0, 0, 153), (20, 28, 20 + art_w, 28 + art_h))
+        shd = shd.filter(ImageFilter.GaussianBlur(radius=12))
+        frame.paste(shd.convert("RGB"), (ax - 20, ay - 12), shd)
+        frame.paste(art, (ax, ay))
+
+    if overlay_enabled and (title or artist):
+        draw = ImageDraw.Draw(frame)
+        scale = H / 1080
+        try:
+            ft = ImageFont.truetype(FONT_BOLD, int(56 * scale))
+            fa = ImageFont.truetype(FONT_REG,  int(36 * scale))
+        except Exception:
+            ft = fa = ImageFont.load_default()
+
+        cx = W // 2
+        ty = int(H * 0.78)
+        ay_t = int(H * 0.85)
+        sd = max(2, int(2 * scale))
+        for dx, dy, col in [(sd, sd, (0,0,0)), (0, 0, (255,255,255))]:
+            draw.text((cx+dx, ty+dy), title or "", font=ft, fill=col, anchor="mm")
+        draw.text((cx, ay_t), (artist or "").upper(), font=fa,
+                  fill=(204,204,204), anchor="mm")
+
+    return frame
+
+
+# ── Crossfade ─────────────────────────────────────────────────────────────────
+def crossfade_to(old_frame, new_frame, W, H):
+    os.makedirs(CF_DIR, exist_ok=True)
+    old = old_frame if old_frame is not None else Image.new("RGB", (W, H), (0,0,0))
+    paths = []
+    for i in range(20):
+        blend = Image.blend(old, new_frame, (i + 1) / 20)
+        p = f"{CF_DIR}/frame-{i:02d}.png"
+        blend.save(p)
+        paths.append(p)
+    for p in paths:
+        mpv_loadfile(p)
+        time.sleep(1 / 30)
+    new_frame.save(NP_FILE)
+    mpv_loadfile(NP_FILE)
+    for p in paths:
+        try: os.unlink(p)
+        except Exception: pass
+
+
+# ── Visualizer frame ──────────────────────────────────────────────────────────
+def render_vis_frame(bars, W, H, mirror):
+    img  = Image.new("RGB", (W, H), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    n = max(len(bars), 1)
+    slot_w = W / n
+    bar_w  = max(1, int(slot_w * 0.6))
+    for i, val in enumerate(bars):
+        bar_h = int(val / 1000 * H)
+        if bar_h == 0:
+            continue
+        x0    = int(i * slot_w + (slot_w - bar_w) / 2)
+        ratio = val / 1000
+        colour = (int(75*(1-ratio)), int(255*ratio), int(130+125*ratio))
+        draw.rectangle([x0, H - bar_h, x0 + bar_w - 1, H - 1], fill=colour)
+        if mirror:
+            draw.rectangle([x0, 0, x0 + bar_w - 1, bar_h - 1], fill=colour)
+    return img
+
+
+# ── YouTube search ────────────────────────────────────────────────────────────
+def find_video_url(artist, title):
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--no-playlist", "--print", "url", "--quiet",
+             f"ytsearch1:{artist} {title} official music video"],
+            capture_output=True, text=True, timeout=15)
+        lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        return lines[0] if lines else None
+    except Exception:
+        return None
+
+
+# ── MPRIS watchers ────────────────────────────────────────────────────────────
+def mpris_metadata_watcher():
+    debounce = [None]
+    buf: dict = {}
+
+    def flush():
+        title  = buf.get("xesam:title",  "").strip()
+        artist = buf.get("xesam:artist", "").strip()
+        album  = buf.get("xesam:album",  "").strip()
+        artUrl = buf.get("mpris:artUrl", "").strip()
+        # strip array: ['Queen'] or ['A', 'B'] → A, B
+        if artist.startswith("[") and artist.endswith("]"):
+            inner = artist[1:-1]
+            artist = ", ".join(p.strip("'\" ") for p in inner.split(","))
+        log.debug("metadata flush: title=%r artist=%r artUrl=%r", title, artist, artUrl)
+        _queue.put(MetadataEvent(title, artist, artUrl, album))
+
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["playerctl", "-F", "metadata"],
+                stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+            for line in proc.stdout:
+                parts = line.strip().split(None, 2)
+                if len(parts) < 3:
+                    continue
+                _, key, val = parts
+                buf[key] = val
+                if debounce[0]:
+                    debounce[0].cancel()
+                debounce[0] = threading.Timer(0.2, flush)
+                debounce[0].start()
+            proc.wait()
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+def mpris_status_watcher():
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["playerctl", "-F", "status"],
+                stdout=subprocess.PIPE, text=True, stderr=subprocess.DEVNULL)
+            for line in proc.stdout:
+                _queue.put(StatusEvent(line.strip()))
+            proc.wait()
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+# ── Display controller ────────────────────────────────────────────────────────
+def display_controller():
+    W, H         = detect_screen_size()
+    mpv_proc     = [None]
+    cava_proc    = [None]
+    fb_mm        = [None]
+    fb_bpp       = [4]
+    vis_stop     = threading.Event()
+    current_mode = "off"
+    old_frame    = [None]
+    skip_count   = [0]
+
+    # ── chvt ──────────────────────────────────────────────────────────────────
+    def chvt(n):
+        subprocess.run(["sudo", "/usr/bin/chvt", str(n)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # ── mpv lifecycle ──────────────────────────────────────────────────────────
+    def launch_mpv():
+        connector, _, _ = detect_connector()
+        # mpv expects short name e.g. "HDMI-A-2", not sysfs name "card1-HDMI-A-2"
+        mpv_connector = connector.split("-", 1)[1]
+        subprocess.run(["pkill", "-f", MPV_SOCK], stderr=subprocess.DEVNULL)
+        time.sleep(0.3)
+        Image.new("RGB", (W, H), (0,0,0)).save(NP_FILE)
+        mpv_proc[0] = subprocess.Popen(
+            ["mpv", "--vo=drm", f"--drm-connector={mpv_connector}", "--fullscreen",
+             f"--input-ipc-server={MPV_SOCK}",
+             "--no-terminal", "--idle=yes",
+             "--ao=pipewire", "--audio-device=pipewire/combined",
+             "--loop-file=inf", "--image-display-duration=inf",
+             NP_FILE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not mpv_wait_ready(5.0):
+            print("display-daemon: mpv IPC not ready after 5s")
+
+    def kill_mpv():
+        try: mpv_quit()
+        except Exception: pass
+        if mpv_proc[0]:
+            try: mpv_proc[0].wait(timeout=3)
+            except Exception: mpv_proc[0].kill()
+            mpv_proc[0] = None
+
+    # ── framebuffer ────────────────────────────────────────────────────────────
+    def open_fb():
+        try:
+            _fw, _fh, bpp = fb_detect()
+            fb_bpp[0] = bpp
+            fd = os.open("/dev/fb0", os.O_RDWR)
+            fb_mm[0] = mmap.mmap(fd, 0)
+            os.close(fd)
+        except PermissionError:
+            with _lock: _g["status"] = "fb_permission_error"
+            fb_mm[0] = None
+        except Exception as e:
+            print(f"display-daemon: fb open: {e}")
+            fb_mm[0] = None
+
+    def close_fb():
+        if fb_mm[0]:
+            try:
+                fb_clear(fb_mm[0], W, H, fb_bpp[0])
+                fb_mm[0].close()
+            except Exception: pass
+            fb_mm[0] = None
+
+    # ── cava ───────────────────────────────────────────────────────────────────
+    def start_cava():
+        if not shutil.which("cava"):
+            with _lock: _g["status"] = "cava_unavailable"
+            return False
+        conf = (
+            "[general]\nbars = 64\nframerate = 30\n\n"
+            "[input]\nmethod = pipewire\nsource = combined.monitor\n\n"
+            "[output]\nmethod = raw\nraw_target = /dev/stdout\n"
+            "data_format = ascii\nascii_max_range = 1000\n"
+        )
+        with open(CAVA_CONF, "w") as f: f.write(conf)
+        vis_stop.clear()
+        cava_proc[0] = subprocess.Popen(
+            ["cava", "-p", CAVA_CONF],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+        def vis_loop():
+            for line in cava_proc[0].stdout:
+                if vis_stop.is_set(): break
+                try:
+                    vals = [int(x) for x in line.strip().split(";") if x.strip()]
+                except Exception: continue
+                if not vals: continue
+                mirror = _state.get("visualizer_mirror", False)
+                img = render_vis_frame(vals, W, H, mirror)
+                if fb_mm[0]: fb_write(fb_mm[0], img, fb_bpp[0])
+            cava_proc[0].wait()
+
+        threading.Thread(target=vis_loop, daemon=True).start()
+        return True
+
+    def stop_cava():
+        vis_stop.set()
+        if cava_proc[0]:
+            try:
+                cava_proc[0].terminate()
+                cava_proc[0].wait(timeout=2)
+            except Exception: pass
+            cava_proc[0] = None
+
+    # ── mode transitions ───────────────────────────────────────────────────────
+    def teardown(mode):
+        if mode == "now-playing":
+            kill_mpv(); chvt(1)
+        elif mode == "visualizer":
+            stop_cava(); close_fb(); chvt(1)
+        elif mode == "music-video":
+            kill_mpv(); chvt(1)
+
+    def setup(mode):
+        """Returns True on success, False on failure (falls back to off)."""
+        log.info("mode → %s", mode)
+        if mode == "off":
+            chvt(1)
+        elif mode == "now-playing":
+            chvt(2); launch_mpv()
+            black = Image.new("RGB", (W, H), (0,0,0))
+            black.save(NP_FILE); mpv_loadfile(NP_FILE)
+            old_frame[0] = black
+            with _lock: _g["status"] = "idle"
+        elif mode == "visualizer":
+            chvt(2); open_fb()
+            if not start_cava():
+                close_fb(); chvt(1); return False
+            with _lock: _g["status"] = "idle"
+        elif mode == "music-video":
+            chvt(2); launch_mpv(); skip_count[0] = 0
+            with _lock: _g["status"] = "idle"
+        return True
+
+    # ── now-playing render ─────────────────────────────────────────────────────
+    def do_render(ev):
+        overlay = _state.get("overlay_enabled", True)
+        log.info("render: %r — %r (artUrl=%s)", ev.title, ev.artist, "yes" if ev.artUrl else "no")
+        new_frame = render_now_playing(ev.title, ev.artist, ev.artUrl, overlay, W, H,
+                                       album=getattr(ev, "album", ""))
+        crossfade_to(old_frame[0], new_frame, W, H)
+        old_frame[0] = new_frame
+        with _lock:
+            _track.update(title=ev.title, artist=ev.artist, artUrl=ev.artUrl)
+            _g["status"] = "playing" if (ev.title or ev.artist) else "idle"
+
+    # ── music video handler ────────────────────────────────────────────────────
+    def handle_video(ev):
+        log.info("music-video: searching for %r — %r", ev.artist, ev.title)
+        with _lock:
+            _track.update(title=ev.title, artist=ev.artist)
+            _g["status"] = "searching"
+
+        url = find_video_url(ev.artist, ev.title)
+
+        if not url:
+            skip_count[0] += 1
+            if skip_count[0] >= 5:
+                skip_count[0] = 0
+                with _lock:
+                    _state["mode"] = "now-playing"
+                    _g["status"] = "no_videos_found"
+                save_state(dict(_state))
+                _queue.put(ModeChangeEvent("now-playing",
+                                           _state.get("overlay_enabled", True),
+                                           _state.get("visualizer_mirror", False)))
+            else:
+                subprocess.run(["playerctl", "next"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+        skip_count[0] = 0
+        subprocess.run(["playerctl", "pause"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with _lock: _g["status"] = "playing"
+        mpv_loadfile(url)
+
+        ended_normally = mpv_wait_end_file()
+        if ended_normally:
+            subprocess.run(["playerctl", "next"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # wait up to 5s for metadata; if none arrives, call play to resume queue
+            deadline = time.time() + 5.0
+            got_event = False
+            while time.time() < deadline:
+                if not _queue.empty():
+                    got_event = True; break
+                time.sleep(0.2)
+            if not got_event:
+                subprocess.run(["playerctl", "play"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            mpv_stop()
+
+    # ── main event loop ────────────────────────────────────────────────────────
+    while True:
+        try:
+            ev = _queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        if isinstance(ev, ModeChangeEvent):
+            new_mode = ev.mode
+            if new_mode != current_mode:
+                teardown(current_mode)
+                ok = setup(new_mode)
+                current_mode = new_mode if ok else "off"
+            # always re-render now-playing with current track after any mode event
+            if current_mode == "now-playing":
+                with _lock:
+                    t = MetadataEvent(_track["title"], _track["artist"], _track["artUrl"])
+                do_render(t)
+
+        elif isinstance(ev, StatusEvent):
+            if ev.status in ("Stopped", ""):
+                with _lock: _g["status"] = "idle"
+                if current_mode == "now-playing":
+                    black = Image.new("RGB", (W, H), (0,0,0))
+                    black.save(NP_FILE); mpv_loadfile(NP_FILE)
+                    old_frame[0] = black
+            else:
+                with _lock:
+                    if _g["status"] not in ("searching", "no_videos_found",
+                                            "cava_unavailable", "fb_permission_error"):
+                        _g["status"] = ("playing"
+                                        if (_track["title"] or _track["artist"])
+                                        else "idle")
+
+        elif isinstance(ev, MetadataEvent):
+            changed = (ev.title != _track["title"] or ev.artist != _track["artist"]
+                       or ev.artUrl != _track["artUrl"])
+            if current_mode == "now-playing":
+                if changed:
+                    do_render(ev)
+            elif current_mode == "music-video":
+                if ev.title != _track["title"] or ev.artist != _track["artist"]:
+                    handle_video(ev)
+            else:
+                with _lock:
+                    _track.update(title=ev.title, artist=ev.artist)
+
+
+# ── HTTP handler ──────────────────────────────────────────────────────────────
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, *a):
+        pass
+
+    def send_json(self, code, data):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/state":
+            with _lock:
+                data = {**_state, "track": dict(_track), "status": _g["status"]}
+            self.send_json(200, data)
+        else:
+            self.send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/set":
+            self.send_json(404, {"error": "not found"}); return
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self.send_json(400, {"error": "bad JSON"}); return
+        if "mode" in body and body["mode"] not in {"off","now-playing","visualizer","music-video"}:
+            self.send_json(400, {"error": "invalid mode"}); return
+        with _lock:
+            for k in ("mode", "overlay_enabled", "visualizer_mirror"):
+                if k in body: _state[k] = body[k]
+            save_state(dict(_state))
+            ev = ModeChangeEvent(_state["mode"], _state["overlay_enabled"],
+                                 _state["visualizer_mirror"])
+        _queue.put(ev)
+        self.send_json(200, {"ok": True})
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    os.makedirs(CF_DIR, exist_ok=True)
+    saved = load_state()
+    with _lock:
+        for k in ("mode", "overlay_enabled", "visualizer_mirror"):
+            if k in saved: _state[k] = saved[k]
+
+    subprocess.run(["pkill", "-f", MPV_SOCK], stderr=subprocess.DEVNULL)
+
+    for fn in (mpris_metadata_watcher, mpris_status_watcher, display_controller):
+        threading.Thread(target=fn, daemon=True).start()
+
+    # fire initial mode setup after controller thread starts
+    time.sleep(0.1)
+    with _lock:
+        ev = ModeChangeEvent(_state["mode"], _state["overlay_enabled"],
+                             _state["visualizer_mirror"])
+    _queue.put(ev)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"display-daemon → localhost:{PORT}")
+    server.serve_forever()

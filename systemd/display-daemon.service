@@ -1,0 +1,12 @@
+[Unit]
+Description=HDMI Display Daemon
+After=pipewire.service
+
+[Service]
+ExecStart=/home/liu/bin/display-daemon
+Restart=on-failure
+RestartSec=3
+Environment=PATH=/home/liu/.venv/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

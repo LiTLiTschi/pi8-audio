@@ -1,0 +1,2977 @@
+#!/usr/bin/env python3
+"""
+audio-sync-web — Web UI to fine-tune delay between BCM2835 (3.5mm) and CM108 (USB).
+Runs on http://pi8:8083
+"""
+
+import http.server
+import json
+import os
+import signal
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+STATE_FILE    = os.path.expanduser("~/.config/audio-sync.json")
+DELAY_CONF    = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/audio-sync-delay.conf")
+COMBINED_CONF = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/combined.conf")
+
+FRONT_ALSA = "alsa_output.platform-bcm2835_audio.stereo-fallback"
+REAR_ALSA  = "alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo"
+DELAY_NODE = "audio-sync-delay-sink"
+
+UFO202_SOURCE = "alsa_input.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo-input"
+UFO202_SINK   = "alsa_output.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo-output"
+
+# HDMI outputs (Raspberry Pi 4 has two HDMI ports)
+HDMI0_ALSA = "alsa_output.platform-fef00700.hdmi.hdmi-stereo"
+HDMI1_ALSA = "alsa_output.platform-fef05700.hdmi.hdmi-stereo"
+
+def detect_hdmi_sinks():
+    """Try to detect actual PipeWire HDMI sink names. Returns (hdmi0, hdmi1)."""
+    try:
+        out = subprocess.run(
+            ["pactl", "list", "sinks", "short"],
+            capture_output=True, text=True, timeout=3
+        ).stdout
+        sinks = [line.split()[1] for line in out.splitlines() if len(line.split()) >= 2]
+        hdmi0 = next((s for s in sinks if "fef00700" in s or "vc4hdmi0" in s or ("hdmi" in s.lower() and "0" in s)), HDMI0_ALSA)
+        hdmi1 = next((s for s in sinks if "fef05700" in s or "vc4hdmi1" in s or ("hdmi" in s.lower() and "1" in s)), HDMI1_ALSA)
+        return hdmi0, hdmi1
+    except Exception:
+        return HDMI0_ALSA, HDMI1_ALSA
+
+
+# ── Volume helpers ────────────────────────────────────────────────────────────
+
+def set_sink_volume(sink_name, percent):
+    """Set volume of a PipeWire/PulseAudio sink (0–100%)."""
+    subprocess.run(
+        ["pactl", "set-sink-volume", sink_name, f"{int(percent)}%"],
+        check=True,
+    )
+
+
+def apply_balance(balance):
+    """Apply front/rear balance. balance: -100 (front only) … 0 (equal) … +100 (rear only)."""
+    balance = max(-100, min(100, balance))
+    if balance <= 0:
+        front_pct = 100
+        rear_pct  = 100 + balance   # 0 at -100, 100 at 0
+    else:
+        front_pct = 100 - balance   # 100 at 0, 0 at +100
+        rear_pct  = 100
+    set_sink_volume(FRONT_ALSA, front_pct)
+    set_sink_volume(REAR_ALSA,  rear_pct)
+
+
+def get_master_volume():
+    """Get combined sink volume as 0–100 int."""
+    try:
+        out = subprocess.run(
+            ["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()  # "Volume: 0.80" or "Volume: 0.80 [MUTED]"
+        parts = out.split()
+        vol = float(parts[1])
+        muted = "[MUTED]" in out
+        return {"volume": int(round(vol * 100)), "muted": muted}
+    except Exception:
+        return {"volume": 50, "muted": False}
+
+
+def set_master_volume(percent):
+    """Set combined sink volume (0–100)."""
+    subprocess.run(
+        ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{int(percent)}%"],
+        check=True
+    )
+
+
+def toggle_mute():
+    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], check=True)
+
+
+# ── MPRIS / playerctl helpers ─────────────────────────────────────────────────
+
+def player_cmd(action):
+    """Run playerctl action: play-pause, next, previous, play, pause."""
+    subprocess.run(["playerctl", action], check=True)
+
+
+def get_player_status():
+    """Get current player metadata and status."""
+    info = {"status": "Stopped", "title": "", "artist": "", "album": "", "artUrl": ""}
+    try:
+        info["status"] = subprocess.run(
+            ["playerctl", "status"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        return info
+    for field in ["title", "artist", "album", "artUrl"]:
+        try:
+            key = f"xesam:{field}" if field != "artUrl" else "mpris:artUrl"
+            val = subprocess.run(
+                ["playerctl", "metadata", key],
+                capture_output=True, text=True, check=True
+            ).stdout.strip()
+            info[field] = val
+        except subprocess.CalledProcessError:
+            pass
+    return info
+
+
+def set_speaker_volumes(front_left, front_right, rear_left, rear_right):
+    """Set individual channel volumes on each sink (0–100)."""
+    subprocess.run(
+        ["pactl", "set-sink-volume", FRONT_ALSA,
+         f"{int(front_left)}%", f"{int(front_right)}%"],
+        check=True
+    )
+    subprocess.run(
+        ["pactl", "set-sink-volume", REAR_ALSA,
+         f"{int(rear_left)}%", f"{int(rear_right)}%"],
+        check=True
+    )
+
+
+# ── USB Line-In (pw-loopback) management ─────────────────────────────────────
+
+_loopback_proc = None  # subprocess.Popen for pw-loopback
+_scream_proc = None    # subprocess.Popen for scream-to-pipewire
+
+
+def start_usb_loopback():
+    """Start pw-loopback: UFO202 line-in → combined sink."""
+    global _loopback_proc
+    stop_usb_loopback()
+    _loopback_proc = subprocess.Popen(
+        [
+            "pw-loopback",
+            "--capture-props", f"target.object={UFO202_SOURCE}",
+            "--playback-props", f"target.object=combined",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_usb_loopback():
+    """Stop any running pw-loopback process."""
+    global _loopback_proc
+    if _loopback_proc is not None:
+        try:
+            _loopback_proc.terminate()
+            _loopback_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _loopback_proc.kill()
+            except Exception:
+                pass
+        _loopback_proc = None
+
+
+_scream_start_time = None  # timestamp when scream receiver was started
+
+
+def get_network_config():
+    """Get network config from state, with defaults."""
+    state = load_state()
+    nc = state.get("network_config", {})
+    return {
+        "group": nc.get("group", "239.255.77.77"),
+        "port": nc.get("port", 4010),
+        "iface": nc.get("iface", ""),
+        "unicast": nc.get("unicast", False),
+        "rate": nc.get("rate", 48000),
+        "format": nc.get("format", "s16"),
+    }
+
+
+def start_scream_receiver(config=None):
+    """Start scream-to-pipewire: receive Scream audio from Windows laptop."""
+    global _scream_proc, _scream_start_time
+    stop_scream_receiver()
+    if config is None:
+        config = get_network_config()
+    env = os.environ.copy()
+    if config.get("group") and config["group"] != "239.255.77.77":
+        env["SCREAM_GROUP"] = config["group"]
+    if config.get("port") and config["port"] != 4010:
+        env["SCREAM_PORT"] = str(config["port"])
+    if config.get("iface"):
+        env["SCREAM_IFACE"] = config["iface"]
+    if config.get("unicast"):
+        env["SCREAM_UNICAST"] = "1"
+    if config.get("rate") and config["rate"] != 48000:
+        env["SCREAM_RATE"] = str(config["rate"])
+    if config.get("format") and config["format"] != "s16":
+        env["SCREAM_FORMAT"] = config["format"]
+    # Always receive 4 channels — Windows Scream stays in Quadraphonic (4.0).
+    # PipeWire's combined sink handles channel routing based on stereo/surround mode.
+    env["SCREAM_CHANNELS"] = "4"
+    _scream_proc = subprocess.Popen(
+        [os.path.expanduser("~/bin/scream-to-pipewire")],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,
+        env=env,
+    )
+    _scream_start_time = time.time()
+
+
+def stop_scream_receiver():
+    """Stop any running scream receiver process."""
+    global _scream_proc
+    if _scream_proc is not None:
+        try:
+            import signal
+            os.killpg(os.getpgid(_scream_proc.pid), signal.SIGTERM)
+            _scream_proc.wait(timeout=3)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(_scream_proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+        _scream_proc = None
+        _scream_start_time = None
+
+
+def get_scream_status():
+    """Return status info for the scream receiver process."""
+    global _scream_proc, _scream_start_time
+    if _scream_proc is None:
+        return {"running": False, "pid": None, "uptime_s": 0}
+    poll = _scream_proc.poll()
+    if poll is not None:
+        _scream_proc = None
+        _scream_start_time = None
+        return {"running": False, "pid": None, "uptime_s": 0, "exit_code": poll}
+    uptime = int(time.time() - _scream_start_time) if _scream_start_time else 0
+    return {"running": True, "pid": _scream_proc.pid, "uptime_s": uptime}
+
+
+def set_source(source):
+    """Set active input source. Only 'usb' and 'network' require action."""
+    stop_usb_loopback()
+    stop_scream_receiver()
+    if source == "usb":
+        start_usb_loopback()
+    elif source == "network":
+        start_scream_receiver()
+
+# ── PipeWire config writers ───────────────────────────────────────────────────
+
+def write_combined(front_node, rear_node, mode="stereo", hdmi_node=None, front_rear=True):
+    if mode == "surround":
+        combined_pos = "FL FR RL RR"
+        rear_combine_pos = "RL RR"
+        desc = "Surround 4.0 (Front + Rear)"
+    else:
+        combined_pos = "FL FR"
+        rear_combine_pos = "FL FR"
+        desc = "Combined Stereo (Front + Rear)"
+    parts = []
+    if front_rear:
+        parts.append("Front + Rear")
+    if hdmi_node:
+        parts.append("HDMI")
+    desc = ("Surround 4.0" if mode == "surround" else "Stereo") + " — " + " + ".join(parts) if parts else "combined"
+
+    rules = ""
+    if front_rear:
+        rules += f"""
+        {{
+          matches = [ {{ media.class = "Audio/Sink" node.name = "{front_node}" }} ]
+          actions = {{ create-stream = {{ combine.audio.position = [ FL FR ] audio.position = [ FL FR ] }} }}
+        }}
+        {{
+          matches = [ {{ media.class = "Audio/Sink" node.name = "{rear_node}" }} ]
+          actions = {{ create-stream = {{ combine.audio.position = [ {rear_combine_pos} ] audio.position = [ FL FR ] }} }}
+        }}"""
+    if hdmi_node:
+        rules += f"""
+        {{
+          matches = [ {{ media.class = "Audio/Sink" node.name = "{hdmi_node}" }} ]
+          actions = {{ create-stream = {{ combine.audio.position = [ FL FR ] audio.position = [ FL FR ] }} }}
+        }}"""
+
+    conf = f"""\
+context.modules = [
+  {{ name = libpipewire-module-combine-stream
+    args = {{
+      combine.mode = sink
+      node.name = "combined"
+      node.description = "{desc}"
+      combine.latency-compensate = true
+      combine.props = {{ audio.position = [ {combined_pos} ] }}
+      stream.props  = {{ stream.dont-remix = true }}
+      stream.rules = [{rules}
+      ]
+    }}
+  }}
+]
+"""
+    with open(COMBINED_CONF, "w") as f:
+        f.write(conf)
+
+
+def write_delay(target, delay_ms):
+    alsa = FRONT_ALSA if target == "front" else REAR_ALSA
+    delay_s = delay_ms / 1000.0
+    conf = f"""\
+# Auto-generated by audio-sync-web. Do not edit.
+context.modules = [
+  {{ name = libpipewire-module-filter-chain
+    args = {{
+      node.description = "audio-sync delay ({target} +{delay_ms}ms)"
+      media.name       = "audio-sync delay"
+      filter.graph = {{
+        nodes = [
+          {{ type = builtin name = dL label = delay control = {{ "Delay (s)" = {delay_s:.6f} }} config = {{ max-delay = 1.0 }} }}
+          {{ type = builtin name = dR label = delay control = {{ "Delay (s)" = {delay_s:.6f} }} config = {{ max-delay = 1.0 }} }}
+        ]
+        inputs  = [ "dL:In" "dR:In" ]
+        outputs = [ "dL:Out" "dR:Out" ]
+      }}
+      audio.channels = 2
+      audio.position = [ FL FR ]
+      capture.props  = {{ node.name = "{DELAY_NODE}" media.class = Audio/Sink }}
+      playback.props = {{ node.name = "audio-sync-out" target.object = "{alsa}" node.passive = true stream.dont-remix = true }}
+    }}
+  }}
+]
+"""
+    with open(DELAY_CONF, "w") as f:
+        f.write(conf)
+
+
+BCM2835_LUA = os.path.expanduser("~/.config/wireplumber/main.lua.d/51-bcm2835-fix.lua")
+CM108_LUA   = os.path.expanduser("~/.config/wireplumber/main.lua.d/52-cm108-fix.lua")
+
+def write_alsa_buffer(sink_node, lua_path, period_size, headroom=None):
+    """Write a WirePlumber ALSA rule for period-size and headroom."""
+    if headroom is None:
+        headroom = period_size
+    conf = f"""rule = {{
+  matches = {{
+    {{
+      {{ "node.name", "equals", "{sink_node}" }},
+    }},
+  }},
+  apply_properties = {{
+    ["api.alsa.period-size"]   = {period_size},
+    ["api.alsa.headroom"]      = {headroom},
+    ["api.alsa.disable-batch"] = true,
+  }},
+}}
+
+table.insert(alsa_monitor.rules, rule)
+"""
+    os.makedirs(os.path.dirname(lua_path), exist_ok=True)
+    with open(lua_path, "w") as f:
+        f.write(conf)
+
+
+def apply_buffers(front_buf, rear_buf):
+    """Write ALSA buffer configs for both sinks and restart PipeWire."""
+    write_alsa_buffer(FRONT_ALSA, BCM2835_LUA, front_buf)
+    write_alsa_buffer(REAR_ALSA, CM108_LUA, rear_buf)
+
+
+def apply_state(state):
+    target   = state.get("target")
+    delay_ms = state.get("delay_ms", 0)
+    mode     = state.get("mode", "stereo")
+
+    # Determine HDMI node and front_rear flag
+    hdmi_node  = None
+    front_rear = state.get("outputs_front_rear", True)
+    if state.get("hdmi_enabled"):
+        port = state.get("hdmi_port", 0)
+        h0, h1 = detect_hdmi_sinks()
+        hdmi_node = h0 if port == 0 else h1
+    # Safety: at least one output must be active
+    if not front_rear and not hdmi_node:
+        front_rear = True
+
+    if not target or delay_ms == 0:
+        if os.path.exists(DELAY_CONF):
+            os.remove(DELAY_CONF)
+        write_combined(FRONT_ALSA, REAR_ALSA, mode, hdmi_node, front_rear)
+    else:
+        write_delay(target, delay_ms)
+        front = DELAY_NODE if target == "front" else FRONT_ALSA
+        rear  = DELAY_NODE if target == "rear"  else REAR_ALSA
+        write_combined(front, rear, mode, hdmi_node, front_rear)
+
+    subprocess.run(
+        ["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"],
+        check=True
+    )
+    # Re-apply volume balance after PipeWire restart (sinks need time to appear)
+    time.sleep(2)
+    state_now = load_state()
+    bal = state_now.get("balance", 0)
+    if bal != 0:
+        try:
+            apply_balance(bal)
+        except subprocess.CalledProcessError:
+            pass  # sinks may not be ready yet
+    # Re-apply source (USB loopback / Scream receiver needs combined sink to be ready)
+    source = state_now.get("source", "bluetooth")
+    if source in ("usb", "network"):
+        try:
+            set_source(source)
+        except Exception:
+            pass
+
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {"target": None, "delay_ms": 0, "balance": 0, "mode": "stereo", "source": "bluetooth"}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+# ── Sync-test tone generator ───────────────────────────────────────────────────
+
+import math, random as _random, struct as _struct
+
+_SAMPLE_RATE  = 48000
+_CHUNK        = 512   # samples per write
+_CYCLE_S      = 1.1   # seconds per beep cycle
+_BEEP_S       = 0.14  # beep duration
+_NOISE_AMP    = 0.04  # white noise relative amplitude (quiet background)
+
+# Shared state for the continuous calibration stream
+_calib_stop   = threading.Event()
+_calib_lock   = threading.Lock()
+_calib_offset = {"front": 0.0, "rear": 0.0, "volume": 0.7}  # volume 0..1
+
+
+def _gen_calib_stream(sink, stop_event):
+    """Continuously stream: white noise + periodic beep, with live-updatable offset."""
+    freq       = 880 if sink == "front" else 330
+    target_alsa = FRONT_ALSA if sink == "front" else REAR_ALSA
+    CYCLE_N    = int(_CYCLE_S * _SAMPLE_RATE)
+    BEEP_N     = int(_BEEP_S  * _SAMPLE_RATE)
+    ATTACK     = int(0.004 * _SAMPLE_RATE)
+    RELEASE    = int(0.025 * _SAMPLE_RATE)
+
+    # WAV header with "unknown" size so pw-cat streams indefinitely
+    hdr = _struct.pack('<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 0x7FFFFFFF, b'WAVE',
+        b'fmt ', 16, 1, 1, _SAMPLE_RATE, _SAMPLE_RATE * 2, 2, 16,
+        b'data', 0x7FFFFFFF)
+
+    proc = subprocess.Popen(
+        ["pw-cat", "--playback", f"--target={target_alsa}",
+         "--format=s16", f"--rate={_SAMPLE_RATE}", "--channels=1", "-"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    try:
+        proc.stdin.write(hdr)
+        pos = 0
+        while not stop_event.is_set():
+            with _calib_lock:
+                offset_s = _calib_offset[sink]
+                vol      = _calib_offset["volume"]
+            amp       = vol * 0.6
+            offset_n  = max(0, int(offset_s * _SAMPLE_RATE / 1000))
+            beep_start = offset_n % CYCLE_N
+
+            chunk = []
+            for _ in range(_CHUNK):
+                p = pos % CYCLE_N
+                # white noise background
+                s = _random.gauss(0, _NOISE_AMP * amp) * 32767
+                # beep
+                bi = p - beep_start
+                if 0 <= bi < BEEP_N:
+                    t   = bi / _SAMPLE_RATE
+                    env = min(bi / max(ATTACK,1), 1.0) * min((BEEP_N-bi) / max(RELEASE,1), 1.0)
+                    s  += amp * env * math.sin(2 * math.pi * freq * t) * 32767
+                chunk.append(max(-32768, min(32767, int(s))))
+                pos += 1
+
+            proc.stdin.write(_struct.pack(f'<{_CHUNK}h', *chunk))
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+_calib_threads = []
+
+def start_calib_stream(front_offset_ms, rear_offset_ms, volume):
+    global _calib_threads
+    stop_calib_stream()
+    with _calib_lock:
+        _calib_offset["front"]  = front_offset_ms
+        _calib_offset["rear"]   = rear_offset_ms
+        _calib_offset["volume"] = max(0.05, min(1.0, volume / 100))
+    _calib_stop.clear()
+    _calib_threads = [
+        threading.Thread(target=_gen_calib_stream, args=("front", _calib_stop), daemon=True),
+        threading.Thread(target=_gen_calib_stream, args=("rear",  _calib_stop), daemon=True),
+    ]
+    for t in _calib_threads:
+        t.start()
+
+def update_calib_offset(front_offset_ms, rear_offset_ms, volume):
+    """Live-update the offset without restarting the stream."""
+    with _calib_lock:
+        _calib_offset["front"]  = front_offset_ms
+        _calib_offset["rear"]   = rear_offset_ms
+        _calib_offset["volume"] = max(0.05, min(1.0, volume / 100))
+
+def stop_calib_stream():
+    _calib_stop.set()
+    for t in _calib_threads:
+        t.join(timeout=1)
+
+
+def play_sync_test(front_offset_ms=0.0, rear_offset_ms=0.0):
+    """One-shot: play beeps with offset baked in as silence prefix (legacy)."""
+    front_wav = _wrap_wav(b'\x00' * max(0, int(front_offset_ms * _SAMPLE_RATE / 1000)) * 2
+                          + _make_beep_samples(880))
+    rear_wav  = _wrap_wav(b'\x00' * max(0, int(rear_offset_ms  * _SAMPLE_RATE / 1000)) * 2
+                          + _make_beep_samples(330))
+    procs = [
+        subprocess.Popen(["pw-cat", "--playback", f"--target={FRONT_ALSA}", "-"],
+                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        subprocess.Popen(["pw-cat", "--playback", f"--target={REAR_ALSA}", "-"],
+                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+    ]
+    procs[0].stdin.write(front_wav); procs[0].stdin.close()
+    procs[1].stdin.write(rear_wav);  procs[1].stdin.close()
+    for p in procs:
+        p.wait(timeout=5)
+
+def _make_beep_samples(freq, duration_s=0.14, amplitude=0.7):
+    n       = int(duration_s * _SAMPLE_RATE)
+    attack  = int(0.004 * _SAMPLE_RATE)
+    release = int(0.025 * _SAMPLE_RATE)
+    samples = []
+    for i in range(n):
+        t = i / _SAMPLE_RATE
+        v = amplitude * math.sin(2 * math.pi * freq * t)
+        env = min(i / max(attack, 1), 1.0) * min((n - i) / max(release, 1), 1.0)
+        samples.append(max(-32768, min(32767, int(v * env * 32767))))
+    return _struct.pack(f'<{n}h', *samples)
+
+def _wrap_wav(pcm_bytes):
+    hdr = _struct.pack('<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 36 + len(pcm_bytes), b'WAVE',
+        b'fmt ', 16, 1, 1, _SAMPLE_RATE, _SAMPLE_RATE * 2, 2, 16,
+        b'data', len(pcm_bytes))
+    return hdr + pcm_bytes
+
+
+# ── Presets ────────────────────────────────────────────────────────────────────
+
+PRESET_KEYS = ("source", "network_config", "buffer_front", "buffer_rear",
+               "delay_ms", "target", "mode", "balance", "hdmi_enabled", "hdmi_port", "outputs_front_rear")
+
+def get_presets():
+    state = load_state()
+    return state.get("presets", {})
+
+def save_preset(name, preset_state):
+    state = load_state()
+    presets = state.setdefault("presets", {})
+    presets[name] = {k: preset_state.get(k) for k in PRESET_KEYS}
+    save_state(state)
+
+def delete_preset(name):
+    state = load_state()
+    state.get("presets", {}).pop(name, None)
+    save_state(state)
+
+def load_preset(name):
+    """Apply a preset: merge into current state and apply."""
+    presets = get_presets()
+    if name not in presets:
+        return False, "Preset nicht gefunden"
+    preset = presets[name]
+    state  = load_state()
+    for k, v in preset.items():
+        if v is not None:
+            state[k] = v
+    save_state(state)
+    # Apply buffer config
+    apply_buffers(state.get("buffer_front", 2048), state.get("buffer_rear", 512))
+    # Apply PipeWire (delay / combined)
+    with _apply_lock:
+        apply_state(state)
+    # Apply source
+    src = state.get("source", "bluetooth")
+    if src in ("usb", "network"):
+        set_source(src)
+    return True, f"Preset '{name}' geladen."
+
+
+# ── HTML ──────────────────────────────────────────────────────────────────────
+
+HTML = """\
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio Sync</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 2rem;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 0.4rem; }
+  .card {
+    background: #1e1e1e;
+    border: 1px solid #333;
+    border-radius: 12px;
+    padding: 2rem;
+    width: 100%;
+    max-width: 480px;
+  }
+  label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.5rem; }
+  select {
+    width: 100%;
+    padding: 0.6rem 0.8rem;
+    background: #2a2a2a;
+    color: #eee;
+    border: 1px solid #444;
+    border-radius: 8px;
+    font-size: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+  }
+  input[type=range] {
+    flex: 1;
+    accent-color: #4af;
+    height: 6px;
+    cursor: pointer;
+  }
+  .ms-display {
+    font-size: 1.6rem;
+    font-weight: 700;
+    min-width: 70px;
+    text-align: right;
+    color: #4af;
+  }
+  .ticks {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.7rem;
+    color: #555;
+    margin-bottom: 1.8rem;
+    padding: 0 2px;
+  }
+  button {
+    width: 100%;
+    padding: 0.75rem;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  #apply-btn {
+    background: #4af;
+    color: #000;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+  }
+  #apply-btn:hover { background: #3ae; }
+  #apply-btn:disabled { background: #555; color: #888; cursor: default; }
+  #reset-btn {
+    background: #2a2a2a;
+    color: #aaa;
+    border: 1px solid #444;
+  }
+  #reset-btn:hover { background: #333; }
+  .mode-toggle {
+    display: flex;
+    gap: 0;
+    margin-bottom: 1.8rem;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid #444;
+  }
+  .mode-btn {
+    flex: 1;
+    padding: 0.7rem 0.5rem;
+    background: #2a2a2a;
+    color: #aaa;
+    border: none;
+    border-radius: 0;
+    font-size: 0.95rem;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .mode-btn:first-child { border-right: 1px solid #444; }
+  .mode-btn.active {
+    background: #4c4;
+    color: #000;
+    font-weight: 600;
+  }
+  .mode-btn:hover:not(.active) { background: #383838; }
+  .source-toggle {
+    display: flex;
+    gap: 0;
+    margin-bottom: 1.8rem;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid #444;
+  }
+  .source-btn {
+    flex: 1;
+    padding: 0.6rem 0.3rem;
+    background: #2a2a2a;
+    color: #aaa;
+    border: none;
+    border-radius: 0;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    border-right: 1px solid #444;
+  }
+  .source-btn:last-child { border-right: none; }
+  .source-btn.active {
+    background: #4af;
+    color: #000;
+    font-weight: 600;
+  }
+  .source-btn:hover:not(.active) { background: #383838; }
+  .svc-btn {
+    flex: 1;
+    padding: 0.6rem 0.5rem;
+    background: #222;
+    color: #ccc;
+    border: 1px solid #444;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .svc-btn:hover { background: #333; }
+  .svc-btn:disabled { opacity: 0.5; cursor: default; }
+  .disp-btn {
+    padding: 0.4rem 0.8rem;
+    background: #222;
+    border: 1px solid #444;
+    border-radius: 4px;
+    color: #ccc;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .disp-btn:hover { background: #333; }
+  .disp-btn.active { background: #4af; color: #000; border-color: #4af; }
+
+  /* ── Tab bar (mobile) ─────────────────────────────────────────── */
+  .tab-bar{display:flex;gap:0.5rem;margin-bottom:1rem}
+  .tab-bar-btn{flex:1;padding:0.65rem;background:#1a1a1a;color:#aaa;border:1px solid #333;border-radius:8px;cursor:pointer;font-size:0.9rem;transition:background 0.15s}
+  .tab-bar-btn:hover{background:#252525}
+  .tab-bar-btn.active{background:#4af;color:#000;border-color:#4af;font-weight:600}
+  .tab-pane{display:none}
+  .tab-pane.active{display:block}
+
+  /* ── Desktop two-column ───────────────────────────────────────── */
+  @media(min-width:900px){
+    .card{max-width:960px}
+    .tab-bar{display:none}
+    .tab-layout{display:flex;gap:1.5rem;align-items:flex-start}
+    .tab-pane{display:block;flex:1;min-width:0}
+  }
+  .divider {
+    border: none;
+    border-top: 1px solid #333;
+    margin: 1.8rem 0;
+  }
+  .balance-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    color: #888;
+    margin-bottom: 0.3rem;
+  }
+  .balance-val {
+    text-align: center;
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: #f90;
+    margin-bottom: 0.3rem;
+  }
+  input[type=range].balance-slider { accent-color: #f90; }
+  #balance-btn {
+    background: #f90;
+    color: #000;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+  }
+  #balance-btn:hover { background: #e80; }
+  #balance-btn:disabled { background: #555; color: #888; cursor: default; }
+  #status {
+    margin-top: 1.2rem;
+    font-size: 0.85rem;
+    color: #888;
+    text-align: center;
+    min-height: 1.2em;
+  }
+  #status.ok  { color: #4c4; }
+  #status.err { color: #f44; }
+  #status.loading { color: #4af; }
+  /* Network config panel */
+  .net-panel {
+    display: none;
+    background: #1e1e1e;
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 0.8rem;
+    margin-bottom: 1.4rem;
+    font-size: 0.85rem;
+  }
+  .net-panel.visible { display: block; }
+  .net-panel label { font-size: 0.8rem; color: #aaa; margin-bottom: 0.2rem; }
+  .net-panel input[type=text], .net-panel input[type=number] {
+    width: 100%;
+    padding: 0.4rem 0.5rem;
+    background: #2a2a2a;
+    color: #eee;
+    border: 1px solid #555;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    margin-bottom: 0.6rem;
+    box-sizing: border-box;
+  }
+  .net-row { display: flex; gap: 0.6rem; }
+  .net-row > div { flex: 1; }
+  .net-status {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.6rem;
+    font-size: 0.8rem;
+    color: #888;
+  }
+  .net-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #555;
+    display: inline-block;
+  }
+  .net-dot.on { background: #4c4; }
+  .net-dot.off { background: #f44; }
+  .net-btns { display: flex; gap: 0.4rem; margin-top: 0.4rem; }
+  .net-btns button {
+    flex: 1;
+    padding: 0.4rem;
+    border: none;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  #net-save-btn { background: #4af; color: #000; font-weight: 600; }
+  #net-save-btn:hover { background: #39e; }
+  #net-restart-btn { background: #555; color: #eee; }
+  #net-restart-btn:hover { background: #666; }
+  .unicast-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+  }
+  .unicast-row input[type=checkbox] { accent-color: #4af; }
+  .net-info {
+    background: #252525;
+    border: 1px solid #383838;
+    border-radius: 6px;
+    padding: 0.6rem 0.7rem;
+    margin-top: 0.6rem;
+    font-size: 0.78rem;
+    color: #999;
+    line-height: 1.5;
+  }
+  .net-info summary {
+    cursor: pointer;
+    color: #4af;
+    font-weight: 600;
+    font-size: 0.82rem;
+    margin-bottom: 0.3rem;
+  }
+  .net-info summary:hover { color: #6cf; }
+  .net-info code {
+    background: #1a1a1a;
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+    color: #ccc;
+    font-size: 0.78rem;
+  }
+  .net-info ol { padding-left: 1.2rem; margin: 0.3rem 0; }
+  .net-info li { margin-bottom: 0.25rem; }
+  .net-listen {
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 0.4rem 0.6rem;
+    margin: 0.4rem 0;
+    font-family: monospace;
+    font-size: 0.8rem;
+    color: #4c4;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="tab-bar">
+    <button class="tab-bar-btn active" onclick="switchTab('audio')">🎵 Audio</button>
+    <button class="tab-bar-btn"        onclick="switchTab('display')">🖥 Display</button>
+  </div>
+
+  <div class="tab-layout">
+    <div class="tab-pane active" id="tab-audio">
+  <label>Modus</label>
+  <div class="mode-toggle">
+    <button class="mode-btn active" id="mode-stereo" onclick="switchMode('stereo')">🔊 Stereo</button>
+    <button class="mode-btn" id="mode-surround" onclick="switchMode('surround')">🔈 Surround 4.0</button>
+  </div>
+
+  <label style="margin-top:1rem">🔈 Outputs</label>
+  <div style="display:flex;flex-direction:column;gap:0.5rem;margin-bottom:1.5rem">
+    <label style="display:flex;align-items:center;gap:0.6rem;cursor:pointer;padding:0.5rem 0.7rem;background:#1e1e1e;border:1px solid #444;border-radius:8px">
+      <input type="checkbox" id="out-front-rear" checked style="width:1.1rem;height:1.1rem;accent-color:#4af;cursor:pointer;flex-shrink:0">
+      <span style="color:#eee;font-size:0.95rem">🔊 Front + Rear <span style="color:#666;font-size:0.8rem">(3.5mm / USB)</span></span>
+    </label>
+    <div style="display:flex;align-items:center;gap:0.6rem;padding:0.5rem 0.7rem;background:#1e1e1e;border:1px solid #444;border-radius:8px">
+      <input type="checkbox" id="hdmi-enabled" style="width:1.1rem;height:1.1rem;accent-color:#4af;cursor:pointer;flex-shrink:0">
+      <label for="hdmi-enabled" style="color:#eee;font-size:0.95rem;cursor:pointer;flex:1;margin:0">🖥 HDMI</label>
+      <select id="hdmi-port" style="background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:6px;padding:0.3rem 0.6rem;font-size:0.85rem">
+        <option value="0">HDMI 0</option>
+        <option value="1">HDMI 1</option>
+      </select>
+    </div>
+  </div>
+
+  <label>Quelle / Input</label>
+  <div class="source-toggle">
+    <button class="source-btn active" id="src-bluetooth" onclick="switchSource('bluetooth')">📶 Bluetooth</button>
+    <button class="source-btn" id="src-local" onclick="switchSource('local')">💻 Lokal</button>
+    <button class="source-btn" id="src-usb" onclick="switchSource('usb')">🎛 USB In</button>
+    <button class="source-btn" id="src-network" onclick="switchSource('network')">🖥 Netzwerk</button>
+  </div>
+  <div style="font-size:0.75rem;color:#888;margin-top:0.25rem;padding:0 0.5rem">
+    📡 DLNA immer aktiv — In <a href="https://play.google.com/store/apps/details?id=com.bubblesoft.android.bubbleupnp" target="_blank" style="color:#4af">BubbleUPnP</a> nach <strong style="color:#ccc">Pi8 Speakers</strong> suchen
+  </div>
+
+  <div class="net-panel" id="net-panel">
+    <div class="net-status">
+      <span class="net-dot" id="net-dot"></span>
+      <span id="net-status-text">Nicht aktiv</span>
+    </div>
+    <div class="net-row">
+      <div>
+        <label>Multicast-Gruppe</label>
+        <input type="text" id="net-group" value="239.255.77.77" placeholder="239.255.77.77">
+      </div>
+      <div>
+        <label>Port</label>
+        <input type="number" id="net-port" value="4010" min="1" max="65535">
+      </div>
+    </div>
+    <label>Interface</label>
+    <select id="net-iface" style="width:100%;padding:0.4rem 0.5rem;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;font-size:0.85rem;margin-bottom:0.6rem">
+      <option value="">Alle (Standard)</option>
+    </select>
+    <div class="net-row">
+      <div>
+        <label>Sample Rate</label>
+        <select id="net-rate" style="width:100%;padding:0.4rem 0.5rem;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;font-size:0.85rem;margin-bottom:0.6rem">
+          <option value="44100">44100 Hz</option>
+          <option value="48000" selected>48000 Hz</option>
+          <option value="96000">96000 Hz</option>
+          <option value="192000">192000 Hz</option>
+        </select>
+      </div>
+      <div>
+        <label>Bit-Tiefe / Format</label>
+        <select id="net-format" style="width:100%;padding:0.4rem 0.5rem;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;font-size:0.85rem;margin-bottom:0.6rem">
+          <option value="s16" selected>16-bit (s16)</option>
+          <option value="s32">32-bit (s32)</option>
+          <option value="f32">32-bit float (f32)</option>
+        </select>
+      </div>
+    </div>
+    <div class="unicast-row">
+      <input type="checkbox" id="net-unicast">
+      <label for="net-unicast" style="margin:0;cursor:pointer">Unicast statt Multicast</label>
+    </div>
+    <div class="net-btns">
+      <button id="net-save-btn" onclick="saveNetConfig()">💾 Speichern</button>
+      <button id="net-restart-btn" onclick="restartNet()">🔄 Neustart</button>
+    </div>
+    <details class="net-info">
+      <summary>ℹ️ Verbindungsinfo & Setup</summary>
+      <div class="net-listen" id="net-listen-info">
+        📡 Lauscht auf: <span id="net-listen-addr">—</span>
+      </div>
+      <strong>Windows Setup:</strong>
+      <ol>
+        <li><a href="https://github.com/duncanthrax/scream/releases" style="color:#4af" target="_blank">Scream-Treiber</a> herunterladen</li>
+        <li>Test-Signing: <code>bcdedit /set testsigning on</code> (Admin-CMD, Neustart)</li>
+        <li><code>Install\\Install-x64.bat</code> als Admin ausführen, Neustart</li>
+        <li>"Scream (WDM)" als <strong>Standard-Audioausgabe</strong> setzen</li>
+        <li>Rechtsklick auf Scream → Eigenschaften → Erweitert → <strong>Quadraphonic (4.0)</strong> für Surround</li>
+        <li>Pi und Windows müssen im <strong>selben Netzwerk</strong> sein (Multicast-fähig)</li>
+      </ol>
+      <span style="color:#888">Latenz: ~5–20ms • UDP Multicast • Kein Pairing nötig</span>
+    </details>
+  </div>
+
+  <div id="section-delay">
+    <label for="target">Welchen Output verzögern?</label>
+    <select id="target">
+      <option value="none">Kein Delay (auto)</option>
+      <option value="front">3.5mm Front (BCM2835)</option>
+      <option value="rear">USB Rear (CM108)</option>
+    </select>
+
+    <label>Verzögerung: <span id="ms-label">0 ms</span></label>
+    <div class="slider-row">
+      <input type="number" id="delay-min" value="0" min="0" max="500" step="0.1"
+        style="width:55px;padding:0.3rem;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;font-size:0.8rem;text-align:center">
+      <input type="range" id="delay-slider" min="0" max="200" step="0.1" value="0">
+      <input type="number" id="delay-max" value="200" min="0" max="500" step="0.1"
+        style="width:55px;padding:0.3rem;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;font-size:0.8rem;text-align:center">
+    </div>
+    <div style="text-align:center;font-size:1.4rem;font-weight:700;color:#4af;margin:0.2rem 0">
+      <span id="ms-big">0 ms</span>
+    </div>
+
+    <button id="apply-btn">Anwenden (~3s Pause)</button>
+    <button id="reset-btn">Reset (kein Delay)</button>
+
+    <hr class="divider">
+
+    <label>ALSA Buffer (beeinflusst Latenz & Stabilität)</label>
+    <div class="net-row" style="margin-bottom:0.5rem">
+      <div>
+        <label style="font-size:0.75rem;color:#888">Front (BCM2835)</label>
+        <select id="buf-front" style="width:100%;padding:0.4rem 0.5rem;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;font-size:0.85rem">
+          <option value="256">256 (~5ms) — minimal</option>
+          <option value="512">512 (~11ms) — niedrig</option>
+          <option value="1024">1024 (~21ms) — mittel</option>
+          <option value="2048" selected>2048 (~43ms) — stabil</option>
+          <option value="4096">4096 (~85ms) — max</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:0.75rem;color:#888">Rear (CM108 USB)</label>
+        <select id="buf-rear" style="width:100%;padding:0.4rem 0.5rem;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:4px;font-size:0.85rem">
+          <option value="256">256 (~5ms) — minimal</option>
+          <option value="512" selected>512 (~11ms) — niedrig</option>
+          <option value="1024">1024 (~21ms) — mittel</option>
+          <option value="2048">2048 (~43ms) — stabil</option>
+          <option value="4096">4096 (~85ms) — max</option>
+        </select>
+      </div>
+    </div>
+    <div style="font-size:0.7rem;color:#666;margin-bottom:0.5rem">⚠️ Zu niedrig = Stottern. Gleiche Werte = minimaler Sync-Versatz.</div>
+    <button id="buf-apply-btn" style="background:#f90;color:#000;font-weight:600">Buffer anwenden (~3s Pause)</button>
+
+    <hr class="divider">
+
+    <label>Front / Rear Balance</label>
+    <div class="balance-val" id="bal-display">Gleich</div>
+    <div class="balance-labels"><span>◀ Front</span><span>Rear ▶</span></div>
+    <div class="slider-row">
+      <span style="color:#555;font-size:.8rem">−100</span>
+      <input type="range" class="balance-slider" id="balance-slider" min="-100" max="100" step="5" value="0">
+      <span style="color:#555;font-size:.8rem">+100</span>
+    </div>
+    <div style="margin-top:1rem">
+      <button id="balance-btn">Balance anwenden</button>
+      <button id="balance-reset-btn" style="background:#2a2a2a;color:#aaa;border:1px solid #444;width:100%;padding:.75rem;border-radius:8px;font-size:1rem;cursor:pointer">Balance Reset (Gleich)</button>
+    </div>
+
+    <hr class="divider">
+  </div>
+
+  <label>🔉 Master Volume</label>
+  <div class="slider-row">
+    <span style="color:#555;font-size:.8rem">0</span>
+    <input type="range" id="vol-slider" min="0" max="100" step="1" value="80" style="accent-color:#4c4">
+    <span class="ms-display" id="vol-display" style="color:#4c4">80%</span>
+  </div>
+  <div style="margin-top:0.5rem;display:flex;gap:0.5rem">
+    <button id="mute-btn" style="background:#2a2a2a;color:#aaa;border:1px solid #444;flex:1">🔇 Mute</button>
+    <a href="/remote" style="flex:1;text-align:center;padding:.75rem;background:#2a2a2a;color:#4af;border:1px solid #444;border-radius:8px;text-decoration:none;font-size:1rem">📱 Remote</a>
+  </div>
+
+  <details id="services-panel" style="margin-top:1rem;border:1px solid #333;border-radius:8px;overflow:hidden">
+    <summary style="padding:0.75rem 1rem;background:#1a1a1a;cursor:pointer;font-size:0.9rem;color:#aaa;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
+      <span>🔧 Services neu starten</span>
+      <span style="font-size:0.75rem;color:#555">▼</span>
+    </summary>
+    <div style="padding:0.75rem;display:flex;flex-direction:column;gap:0.5rem">
+      <div class="net-row">
+        <button class="svc-btn" data-svc="pipewire pipewire-pulse wireplumber" data-scope="user">🔄 PipeWire</button>
+        <button class="svc-btn" data-svc="bluetooth" data-scope="system">🔵 Bluetooth</button>
+      </div>
+      <div class="net-row">
+        <button class="svc-btn" data-svc="audio-sync-web" data-scope="user">🌐 Web UI</button>
+        <button class="svc-btn" data-svc="dlna-renderer" data-scope="user">📡 DLNA</button>
+      </div>
+      <button class="svc-btn" data-svc="ALL" style="background:#500;color:#faa;border-color:#800;font-weight:600">⚡ Alle neu starten</button>
+      <hr style="border:none;border-top:1px solid #333;margin:0.25rem 0">
+      <div class="net-row">
+        <button id="power-stop-btn" onclick="powerAction('stop')" style="flex:1;padding:0.6rem 0.5rem;background:#300;color:#f88;border:1px solid #500;border-radius:8px;font-size:0.85rem;cursor:pointer">⏹ System stoppen</button>
+        <button id="power-start-btn" onclick="powerAction('start')" style="flex:1;padding:0.6rem 0.5rem;background:#030;color:#8f8;border:1px solid #050;border-radius:8px;font-size:0.85rem;cursor:pointer">▶ System starten</button>
+      </div>
+      <div id="svc-status" style="font-size:0.8rem;color:#888;min-height:1.2em;text-align:center"></div>
+    </div>
+  </details>
+    </div><!-- /#tab-audio -->
+
+    <div class="tab-pane" id="tab-display">
+  <!-- ── Display control ── -->
+  <details id="display-panel" open style="margin-top:1rem;border:1px solid #333;border-radius:8px;overflow:hidden">
+    <summary style="padding:0.75rem 1rem;background:#1a1a1a;cursor:pointer;font-size:0.9rem;color:#aaa;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
+      <span>🖥 Display</span>
+      <span style="font-size:0.75rem;color:#555">▼</span>
+    </summary>
+    <div style="padding:1rem">
+      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem">
+        <button id="disp-off"   class="disp-btn" onclick="setDisplayMode('off')">TTY</button>
+        <button id="disp-np"    class="disp-btn" onclick="setDisplayMode('now-playing')">Now Playing</button>
+        <button id="disp-vis"   class="disp-btn" onclick="setDisplayMode('visualizer')">Visualizer</button>
+        <button id="disp-video" class="disp-btn" onclick="setDisplayMode('music-video')">Video</button>
+      </div>
+      <div id="disp-overlay-row" style="display:none;margin-bottom:0.5rem">
+        <label style="font-size:0.9rem;color:#ccc"><input type="checkbox" id="disp-overlay" onchange="applyDisplayOptions()"> Show title / artist overlay</label>
+      </div>
+      <div id="disp-mirror-row" style="display:none;margin-bottom:0.5rem">
+        <label style="font-size:0.9rem;color:#ccc"><input type="checkbox" id="disp-mirror" onchange="applyDisplayOptions()"> Mirror bars</label>
+      </div>
+      <div id="disp-status" style="font-size:0.8rem;color:#888;min-height:1.2em"></div>
+    </div>
+  </details>
+
+  <!-- ── Sync calibration game ── -->
+  <details id="sync-game-panel" style="margin-top:1rem;border:1px solid #335;border-radius:8px;overflow:hidden">
+    <summary style="padding:0.75rem 1rem;background:#111a2a;cursor:pointer;font-size:0.9rem;color:#aac;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
+      <span>🎯 Sync-Kalibrierung</span>
+      <span style="font-size:0.75rem;color:#556">▼</span>
+    </summary>
+    <div style="padding:0.75rem;display:flex;flex-direction:column;gap:0.6rem;font-size:0.9rem">
+      <div style="color:#888;font-size:0.78rem;line-height:1.5">
+        Spielt <strong style="color:#fa8">hohen Ton (880Hz)</strong> auf Front + <strong style="color:#8af">tiefen Ton (330Hz)</strong> auf Rear. Das gemessene Delay wird als <em>Stille-Prefix</em> in die Audio-Daten eingebaut — kein PipeWire-Neustart nötig. Klicke welchen du früher hörst.
+      </div>
+      <!-- SA params -->
+      <div style="background:#0d1020;border-radius:6px;padding:0.5rem 0.7rem;display:flex;flex-direction:column;gap:0.4rem">
+        <div style="font-size:0.75rem;color:#669;font-weight:600">🧬 Simulated Annealing</div>
+        <div class="net-row">
+          <div style="display:flex;flex-direction:column;gap:2px">
+            <label style="font-size:0.7rem;color:#668">Start-Temp (ms)</label>
+            <input id="calib-init-temp" type="number" value="50" min="1" max="2000" step="1"
+              style="width:100%;background:#111;color:#aaf;border:1px solid #446;border-radius:4px;padding:0.3rem 0.5rem;font-size:0.85rem">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:2px">
+            <label style="font-size:0.7rem;color:#668">Cooling (0.5–0.99)</label>
+            <input id="calib-cooling" type="number" value="0.75" min="0.5" max="0.99" step="0.01"
+              style="width:100%;background:#111;color:#aaf;border:1px solid #446;border-radius:4px;padding:0.3rem 0.5rem;font-size:0.85rem">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:2px">
+            <label style="font-size:0.7rem;color:#668">Min-Temp (ms)</label>
+            <input id="calib-min-temp" type="number" value="0.5" min="0.01" max="10" step="0.1"
+              style="width:100%;background:#111;color:#aaf;border:1px solid #446;border-radius:4px;padding:0.3rem 0.5rem;font-size:0.85rem">
+          </div>
+        </div>
+      </div>
+      <!-- State display -->
+      <div style="display:flex;align-items:center;justify-content:space-between;background:#1a1a2a;border-radius:6px;padding:0.5rem 0.8rem">
+        <div style="text-align:center">
+          <div style="font-size:0.68rem;color:#668">Aktueller Test-Offset</div>
+          <div id="calib-delay-display" style="font-size:1.3rem;font-weight:700;color:#4af">0.0 ms</div>
+          <div id="calib-who-display" style="font-size:0.7rem;color:#668">—</div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-size:0.68rem;color:#668">Temperatur</div>
+          <div id="calib-step-display" style="font-size:1.1rem;font-weight:600;color:#fa8">50 ms</div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-size:0.68rem;color:#668">Schritte</div>
+          <div id="calib-steps-display" style="font-size:1.1rem;font-weight:600;color:#888">0</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center">
+        <button id="calib-play-btn" style="flex:1;background:#1a3a1a;color:#8f8;border:1px solid #464;border-radius:6px;padding:0.7rem;font-size:0.95rem;cursor:pointer">▶ Stream starten</button>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+          <label style="font-size:0.68rem;color:#668">Lautstärke</label>
+          <span id="calib-vol-display" style="font-size:0.85rem;color:#fa8;font-weight:600">–</span>
+        </div>
+      </div>
+      <div class="net-row" style="gap:0.5rem">
+        <button id="calib-front-btn" style="flex:1;background:#2a1a1a;color:#faa;border:1px solid #644;border-radius:6px;padding:0.9rem 0.5rem;font-size:0.85rem;cursor:pointer;line-height:1.3">◀ Front war<br>früher</button>
+        <button id="calib-rear-btn"  style="flex:1;background:#1a1a2a;color:#aaf;border:1px solid #446;border-radius:6px;padding:0.9rem 0.5rem;font-size:0.85rem;cursor:pointer;line-height:1.3">Rear war<br>früher ▶</button>
+      </div>
+      <button id="calib-sync-btn" style="background:#1a2a1a;color:#afa;border:1px solid #464;border-radius:6px;padding:0.65rem;font-size:0.9rem;cursor:pointer;font-weight:600">✓ Synchron! → Als Delay übernehmen</button>
+      <button id="calib-reset-btn" style="background:#1a1a1a;color:#666;border:1px solid #333;border-radius:6px;padding:0.4rem;font-size:0.8rem;cursor:pointer">↺ Zurücksetzen</button>
+      <div id="calib-status" style="font-size:0.8rem;color:#888;text-align:center;min-height:1.2em"></div>
+    </div>
+  </details>
+
+  <!-- ── Presets ── -->
+  <details id="presets-panel" style="margin-top:1rem;border:1px solid #353;border-radius:8px;overflow:hidden">
+    <summary style="padding:0.75rem 1rem;background:#111e11;cursor:pointer;font-size:0.9rem;color:#aca;user-select:none;list-style:none;display:flex;justify-content:space-between;align-items:center">
+      <span>💾 Presets</span>
+      <span style="font-size:0.75rem;color:#565">▼</span>
+    </summary>
+    <div style="padding:0.75rem;display:flex;flex-direction:column;gap:0.6rem">
+      <div style="color:#888;font-size:0.75rem">Speichert: Quelle, Netzwerk-Config, Buffer, Delay, Modus, Balance — <em>nicht</em> Lautstärke.</div>
+      <div style="display:flex;gap:0.5rem">
+        <input id="preset-name-input" type="text" placeholder="Preset-Name…"
+          style="flex:1;background:#222;color:#eee;border:1px solid #555;border-radius:6px;padding:0.5rem 0.7rem;font-size:0.9rem">
+        <button id="preset-save-btn" style="background:#1a3a1a;color:#8f8;border:1px solid #464;border-radius:6px;padding:0.5rem 0.8rem;font-size:0.9rem;cursor:pointer;white-space:nowrap">💾 Speichern</button>
+      </div>
+      <div id="presets-list" style="display:flex;flex-direction:column;gap:0.4rem"></div>
+      <div id="preset-status" style="font-size:0.8rem;color:#888;text-align:center;min-height:1.2em"></div>
+    </div>
+  </details>
+    </div><!-- /#tab-display -->
+  </div><!-- /.tab-layout -->
+
+  <div id="status"></div>
+</div>
+
+<script>
+const slider   = document.getElementById('delay-slider');
+const msBig    = document.getElementById('ms-big');
+const msLabel  = document.getElementById('ms-label');
+const applyBtn = document.getElementById('apply-btn');
+const resetBtn = document.getElementById('reset-btn');
+const status   = document.getElementById('status');
+const targetSel = document.getElementById('target');
+const delayMin = document.getElementById('delay-min');
+const delayMax = document.getElementById('delay-max');
+
+function updateDisplay() {
+  const v = parseFloat(slider.value);
+  const txt = v % 1 === 0 ? v + ' ms' : (parseFloat(slider.step) <= 0.01 ? v.toFixed(2) : v.toFixed(1)) + ' ms';
+  msBig.textContent  = txt;
+  msLabel.textContent = txt;
+}
+
+function updateSliderRange() {
+  const lo = parseFloat(delayMin.value) || 0;
+  const hi = parseFloat(delayMax.value) || 200;
+  slider.min = lo;
+  slider.max = hi;
+  // Auto step: 0.01 when range ≤ 5ms, 0.1 when ≤ 50ms, 1 otherwise
+  slider.step = (hi - lo) <= 5 ? 0.01 : ((hi - lo) <= 50 ? 0.1 : 1);
+  if (parseFloat(slider.value) < lo) slider.value = lo;
+  if (parseFloat(slider.value) > hi) slider.value = hi;
+  updateDisplay();
+}
+
+delayMin.addEventListener('change', updateSliderRange);
+delayMax.addEventListener('change', updateSliderRange);
+
+slider.addEventListener('input', updateDisplay);
+updateDisplay();
+
+async function applyDelay(target, delay_ms) {
+  applyBtn.disabled = true;
+  status.className = 'loading';
+  status.textContent = 'Wende an… PipeWire wird neu gestartet…';
+  try {
+    const res = await fetch('/apply', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ target, delay_ms: parseFloat(delay_ms) })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      status.className = 'ok';
+      status.textContent = data.msg;
+    } else {
+      status.className = 'err';
+      status.textContent = 'Fehler: ' + data.msg;
+    }
+  } catch(e) {
+    status.className = 'err';
+    status.textContent = 'Netzwerkfehler: ' + e;
+  }
+  applyBtn.disabled = false;
+}
+
+applyBtn.addEventListener('click', () => {
+  const t = targetSel.value === 'none' ? null : targetSel.value;
+  applyDelay(t, slider.value);
+});
+
+resetBtn.addEventListener('click', () => {
+  targetSel.value = 'none';
+  slider.value = 0;
+  updateDisplay();
+  applyDelay(null, 0);
+});
+
+// Load current state
+let _netConfigLoaded = false;
+fetch('/state').then(r => r.json()).then(s => {
+  if (s.target) targetSel.value = s.target;
+  if (s.delay_ms) { slider.value = s.delay_ms; updateDisplay(); }
+  if (s.balance != null) { balSlider.value = s.balance; updateBalDisplay(); }
+  if (s.mode) setModeUI(s.mode);
+  if (s.source) setSourceUI(s.source);
+  if (s.buffer_front) document.getElementById('buf-front').value = s.buffer_front;
+  if (s.buffer_rear)  document.getElementById('buf-rear').value  = s.buffer_rear;
+  if (s.hdmi_enabled        != null) document.getElementById('hdmi-enabled').checked  = s.hdmi_enabled;
+  if (s.hdmi_port           != null) document.getElementById('hdmi-port').value        = s.hdmi_port;
+  if (s.outputs_front_rear  != null) document.getElementById('out-front-rear').checked = s.outputs_front_rear;
+  updateContextUI();
+});
+
+// ── Buffer apply ──
+document.getElementById('buf-apply-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('buf-apply-btn');
+  btn.disabled = true;
+  status.className = 'loading';
+  status.textContent = 'Buffer wird angewendet… PipeWire wird neu gestartet…';
+  try {
+    const res = await fetch('/buffers', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        front: parseInt(document.getElementById('buf-front').value),
+        rear:  parseInt(document.getElementById('buf-rear').value)
+      })
+    });
+    const data = await res.json();
+    status.className = data.ok ? 'ok' : 'err';
+    status.textContent = data.msg || 'Fehler';
+  } catch(e) {
+    status.className = 'err';
+    status.textContent = 'Netzwerkfehler: ' + e;
+  }
+  btn.disabled = false;
+});
+function setModeUI(mode) {
+  document.getElementById('mode-stereo').classList.toggle('active', mode === 'stereo');
+  document.getElementById('mode-surround').classList.toggle('active', mode === 'surround');
+}
+
+async function switchMode(mode) {
+  setModeUI(mode);
+  status.className = 'loading';
+  status.textContent = 'Modus wird gewechselt… PipeWire wird neu gestartet…';
+  try {
+    const res = await fetch('/mode', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ mode })
+    });
+    const data = await res.json();
+    if (data.ok) { status.className = 'ok'; status.textContent = data.msg; }
+    else { status.className = 'err'; status.textContent = 'Fehler: ' + data.msg; }
+  } catch(e) { status.className = 'err'; status.textContent = 'Netzwerkfehler: ' + e; }
+}
+
+// ── Output toggles ──
+function updateContextUI() {
+  const hasFrontRear = document.getElementById('out-front-rear').checked;
+  const hasHdmi      = document.getElementById('hdmi-enabled').checked;
+  // Must keep at least one output active
+  if (!hasFrontRear && !hasHdmi) {
+    document.getElementById('out-front-rear').checked = true;
+    return;
+  }
+  document.getElementById('section-delay').style.display = hasFrontRear ? '' : 'none';
+}
+
+async function applyOutputs() {
+  const frontRear = document.getElementById('out-front-rear').checked;
+  const enabled   = document.getElementById('hdmi-enabled').checked;
+  const port      = parseInt(document.getElementById('hdmi-port').value);
+  updateContextUI();
+  status.className = 'loading';
+  status.textContent = 'Outputs werden angewendet… PipeWire neu starten…';
+  try {
+    const res = await fetch('/hdmi', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ enabled, port, outputs_front_rear: frontRear })
+    });
+    const data = await res.json();
+    if (data.ok) { status.className = 'ok'; status.textContent = data.msg; }
+    else { status.className = 'err'; status.textContent = 'Fehler: ' + data.msg; }
+  } catch(e) { status.className = 'err'; status.textContent = 'Netzwerkfehler: ' + e; }
+}
+
+document.getElementById('out-front-rear').addEventListener('change', applyOutputs);
+document.getElementById('hdmi-enabled').addEventListener('change', applyOutputs);
+document.getElementById('hdmi-port').addEventListener('change', () => {
+  if (document.getElementById('hdmi-enabled').checked) applyOutputs();
+});
+
+// ── Tab switching ──
+function switchTab(name) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-bar-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name)?.classList.add('active');
+  document.querySelectorAll('.tab-bar-btn').forEach(b => {
+    if (b.textContent.includes(name === 'audio' ? '🎵' : '🖥'))
+      b.classList.add('active');
+  });
+  if (name === 'display') loadDisplayState();
+}
+
+// ── Display control ──
+let _dispMode = 'off';
+let _dispPollTimer = null;
+const _dispStatusText = {
+  idle: 'No player connected',
+  playing: null,  // set dynamically
+  searching: 'Searching for video\u2026',
+  no_videos_found: 'No videos found \u2014 switched to Now Playing',
+  cava_unavailable: 'cava not installed \u2014 visualizer unavailable',
+  fb_permission_error: 'Framebuffer error \u2014 add liu to video group',
+  daemon_down: 'Display service unavailable',
+};
+
+async function loadDisplayState() {
+  try {
+    const s = await fetch('/display-state').then(r => r.json());
+    _dispMode = s.mode;
+    const daemonDown = s.status === 'daemon_down';
+    document.querySelectorAll('.disp-btn').forEach(b => {
+      b.classList.remove('active');
+      b.disabled = daemonDown;
+      b.style.opacity = daemonDown ? '0.4' : '';
+      b.style.cursor  = daemonDown ? 'not-allowed' : '';
+    });
+    if (!daemonDown) {
+      const map = {'off':'disp-off','now-playing':'disp-np','visualizer':'disp-vis','music-video':'disp-video'};
+      document.getElementById(map[s.mode])?.classList.add('active');
+    }
+    document.getElementById('disp-overlay-row').style.display = s.mode === 'now-playing' ? '' : 'none';
+    document.getElementById('disp-mirror-row').style.display  = s.mode === 'visualizer'  ? '' : 'none';
+    document.getElementById('disp-overlay').checked = !!s.overlay_enabled;
+    document.getElementById('disp-mirror').checked  = !!s.visualizer_mirror;
+    const t = s.track;
+    const statusEl = document.getElementById('disp-status');
+    if (s.status === 'playing' && t && (t.title || t.artist)) {
+      statusEl.textContent = `Playing: ${t.title || '?'} \u2014 ${t.artist || '?'}`;
+    } else {
+      statusEl.textContent = _dispStatusText[s.status] || s.status;
+    }
+  } catch(e) {
+    document.getElementById('disp-status').textContent = 'Display service unavailable';
+    document.querySelectorAll('.disp-btn').forEach(b => {
+      b.disabled = true; b.style.opacity = '0.4'; b.style.cursor = 'not-allowed';
+    });
+  }
+}
+
+async function setDisplayMode(mode) {
+  const body = {mode, overlay_enabled: document.getElementById('disp-overlay').checked,
+                visualizer_mirror: document.getElementById('disp-mirror').checked};
+  await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  loadDisplayState();
+}
+
+async function applyDisplayOptions() {
+  const body = {mode: _dispMode, overlay_enabled: document.getElementById('disp-overlay').checked,
+                visualizer_mirror: document.getElementById('disp-mirror').checked};
+  await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+}
+
+document.getElementById('display-panel').addEventListener('toggle', e => {
+  if (e.target.open) {
+    loadDisplayState();
+    _dispPollTimer = setInterval(loadDisplayState, 3000);
+  } else {
+    clearInterval(_dispPollTimer);
+    _dispPollTimer = null;
+  }
+});
+
+// ── Power management ──
+async function powerAction(action) {
+  const svcStatus = document.getElementById('svc-status');
+  document.querySelectorAll('.svc-btn, #power-stop-btn, #power-start-btn').forEach(b => b.disabled = true);
+  svcStatus.style.color = '#fa0';
+  svcStatus.textContent = action === 'stop' ? 'System wird gestoppt…' : 'System wird gestartet…';
+  try {
+    const res = await fetch('/power', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ action })
+    });
+    const data = await res.json();
+    svcStatus.style.color = data.ok ? '#4c4' : '#f44';
+    svcStatus.textContent = data.msg || (data.ok ? 'Fertig.' : 'Fehler');
+  } catch(e) {
+    svcStatus.style.color = '#f44';
+    svcStatus.textContent = 'Fehler: ' + e;
+  }
+  document.querySelectorAll('.svc-btn, #power-stop-btn, #power-start-btn').forEach(b => b.disabled = false);
+}
+
+// ── Source toggle ──
+function setSourceUI(source) {
+  document.getElementById('src-bluetooth').classList.toggle('active', source === 'bluetooth');
+  document.getElementById('src-local').classList.toggle('active', source === 'local');
+  document.getElementById('src-usb').classList.toggle('active', source === 'usb');
+  document.getElementById('src-network').classList.toggle('active', source === 'network');
+  document.getElementById('net-panel').classList.toggle('visible', source === 'network');
+  if (source === 'network') { pollNetStatus(); startNetPoll(); } else { stopNetPoll(); }
+}
+
+async function switchSource(source) {
+  setSourceUI(source);
+  status.className = 'loading';
+  status.textContent = 'Quelle wird gewechselt…';
+  try {
+    const res = await fetch('/source', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ source })
+    });
+    const data = await res.json();
+    if (data.ok) { status.className = 'ok'; status.textContent = data.msg; }
+    else { status.className = 'err'; status.textContent = 'Fehler: ' + data.msg; }
+  } catch(e) { status.className = 'err'; status.textContent = 'Netzwerkfehler: ' + e; }
+}
+
+// ── Network config ──
+let _netPollTimer = null;
+
+function startNetPoll() {
+  stopNetPoll();
+  _netPollTimer = setInterval(pollNetStatus, 3000);
+}
+
+function stopNetPoll() {
+  if (_netPollTimer) { clearInterval(_netPollTimer); _netPollTimer = null; }
+}
+
+async function pollNetStatus() {
+  try {
+    const res = await fetch('/network-status');
+    const d = await res.json();
+    const dot = document.getElementById('net-dot');
+    const txt = document.getElementById('net-status-text');
+    if (d.running) {
+      dot.className = 'net-dot on';
+      const mins = Math.floor(d.uptime_s / 60);
+      const secs = d.uptime_s % 60;
+      txt.textContent = 'Empfängt (PID ' + d.pid + ', ' + mins + 'm' + secs + 's)';
+    } else {
+      dot.className = 'net-dot off';
+      txt.textContent = d.exit_code != null ? 'Gestoppt (Exit ' + d.exit_code + ')' : 'Nicht aktiv';
+    }
+    if (d.config && !_netConfigLoaded) {
+      _netConfigLoaded = true;
+      document.getElementById('net-group').value = d.config.group || '239.255.77.77';
+      document.getElementById('net-port').value = d.config.port || 4010;
+      document.getElementById('net-unicast').checked = !!d.config.unicast;
+      document.getElementById('net-rate').value = d.config.rate || 48000;
+      document.getElementById('net-format').value = d.config.format || 's16';
+    }
+    // Populate interface dropdown (always update list, preserve selection)
+    if (d.interfaces) {
+      const sel = document.getElementById('net-iface');
+      const savedIface = _netConfigLoaded ? sel.value : (d.config && d.config.iface || '');
+      const prev = sel.value;
+      sel.innerHTML = '<option value="">Alle (Standard)</option>';
+      for (const iface of d.interfaces) {
+        const opt = document.createElement('option');
+        opt.value = iface.name;
+        opt.textContent = iface.name + ' — ' + iface.ip;
+        sel.appendChild(opt);
+      }
+      // Restore saved value (on first load use config, otherwise keep current)
+      sel.value = _netConfigLoaded ? prev : savedIface;
+      if (!sel.value && savedIface) {
+        // Interface might not exist anymore, add it as option anyway
+        const opt = document.createElement('option');
+        opt.value = savedIface;
+        opt.textContent = savedIface + ' (nicht gefunden)';
+        sel.appendChild(opt);
+        sel.value = savedIface;
+      }
+    }
+    // Update listen info
+    const listenEl = document.getElementById('net-listen-addr');
+    if (d.config && listenEl) {
+      const mode = d.config.unicast ? 'Unicast' : 'Multicast ' + (d.config.group || '239.255.77.77');
+      const port = d.config.port || 4010;
+      const host = d.hostname || '?';
+      const ip = d.pi_ip || '?';
+      const iface = d.config.iface ? ' (' + d.config.iface + ')' : '';
+      const rate = (d.config.rate || 48000) / 1000 + 'kHz';
+      const fmt = d.config.format || 's16';
+      listenEl.textContent = mode + ':' + port + iface + ' • ' + rate + '/' + fmt + ' — ' + host + ' (' + ip + ')';
+    }
+  } catch(e) {}
+}
+
+async function saveNetConfig() {
+  const cfg = {
+    group: document.getElementById('net-group').value,
+    port: parseInt(document.getElementById('net-port').value) || 4010,
+    iface: document.getElementById('net-iface').value,
+    unicast: document.getElementById('net-unicast').checked,
+    rate: parseInt(document.getElementById('net-rate').value) || 48000,
+    format: document.getElementById('net-format').value || 's16',
+  };
+  status.className = 'loading';
+  status.textContent = 'Netzwerk-Konfiguration wird gespeichert…';
+  try {
+    const res = await fetch('/network-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg)
+    });
+    const data = await res.json();
+    if (data.ok) { status.className = 'ok'; status.textContent = data.msg; }
+    else { status.className = 'err'; status.textContent = 'Fehler: ' + data.msg; }
+    pollNetStatus();
+  } catch(e) { status.className = 'err'; status.textContent = 'Netzwerkfehler: ' + e; }
+}
+
+async function restartNet() {
+  await saveNetConfig();
+}
+
+// ── Balance ──
+const balSlider   = document.getElementById('balance-slider');
+const balDisplay  = document.getElementById('bal-display');
+const balBtn      = document.getElementById('balance-btn');
+const balResetBtn = document.getElementById('balance-reset-btn');
+
+function updateBalDisplay() {
+  const v = parseInt(balSlider.value);
+  if (v === 0) {
+    balDisplay.textContent = 'Gleich';
+  } else if (v < 0) {
+    const front = 100, rear = 100 + v;
+    balDisplay.textContent = 'Front ' + front + '% / Rear ' + rear + '%';
+  } else {
+    const front = 100 - v, rear = 100;
+    balDisplay.textContent = 'Front ' + front + '% / Rear ' + rear + '%';
+  }
+}
+balSlider.addEventListener('input', updateBalDisplay);
+updateBalDisplay();
+
+async function setBalance(val) {
+  balBtn.disabled = true;
+  status.className = 'loading';
+  status.textContent = 'Balance wird gesetzt…';
+  try {
+    const res = await fetch('/balance', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ balance: parseInt(val) })
+    });
+    const data = await res.json();
+    if (data.ok) { status.className = 'ok'; status.textContent = data.msg; }
+    else { status.className = 'err'; status.textContent = 'Fehler: ' + data.msg; }
+  } catch(e) { status.className = 'err'; status.textContent = 'Netzwerkfehler: ' + e; }
+  balBtn.disabled = false;
+}
+
+balBtn.addEventListener('click', () => setBalance(balSlider.value));
+balResetBtn.addEventListener('click', () => {
+  balSlider.value = 0;
+  updateBalDisplay();
+  setBalance(0);
+});
+
+// ── Master Volume ──
+const volSlider  = document.getElementById('vol-slider');
+const volDisplay = document.getElementById('vol-display');
+const muteBtn    = document.getElementById('mute-btn');
+let volTimeout = null;
+
+volSlider.addEventListener('input', () => {
+  volDisplay.textContent = volSlider.value + '%';
+  clearTimeout(volTimeout);
+  volTimeout = setTimeout(() => {
+    fetch('/volume', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({volume: parseInt(volSlider.value)})
+    });
+  }, 100);
+});
+
+muteBtn.addEventListener('click', () => {
+  fetch('/volume', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mute_toggle: true})
+  }).then(r => r.json()).then(d => {
+    if (d.muted) { muteBtn.textContent = '🔊 Unmute'; }
+    else { muteBtn.textContent = '🔇 Mute'; }
+  });
+});
+
+// Load volume on start
+fetch('/volume').then(r => r.json()).then(d => {
+  volSlider.value = d.volume;
+  volDisplay.textContent = d.volume + '%';
+  muteBtn.textContent = d.muted ? '🔊 Unmute' : '🔇 Mute';
+});
+
+// ── Service restart ──
+document.querySelectorAll('.svc-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const svc = btn.dataset.svc;
+    const scope = btn.dataset.scope || 'user';
+    const svcStatus = document.getElementById('svc-status');
+    document.querySelectorAll('.svc-btn').forEach(b => b.disabled = true);
+    svcStatus.style.color = '#fa0';
+    svcStatus.textContent = `Starte ${svc === 'ALL' ? 'alle Services' : svc} neu…`;
+    try {
+      const res = await fetch('/restart-service', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ service: svc, scope })
+      });
+      const data = await res.json();
+      svcStatus.style.color = data.ok ? '#4c4' : '#f44';
+      svcStatus.textContent = data.msg;
+    } catch(e) {
+      svcStatus.style.color = '#f44';
+      svcStatus.textContent = 'Fehler: ' + e;
+    }
+    document.querySelectorAll('.svc-btn').forEach(b => b.disabled = false);
+  });
+});
+
+// ── Sync calibration game (Simulated Annealing) ───────────────────────────────
+const calib = { delay: 0, temp: 50, steps: 0, streaming: false };
+
+function calibVol()     { return parseFloat(document.getElementById('vol-slider')?.value || 70); }
+function calibTemp()    { return parseFloat(document.getElementById('calib-init-temp').value)  || 50; }
+function calibCooling() { return parseFloat(document.getElementById('calib-cooling').value)    || 0.75; }
+function calibMinTemp() { return parseFloat(document.getElementById('calib-min-temp').value)   || 0.5; }
+
+function fmtMs(v) {
+  const a = Math.abs(v);
+  return a === 0 ? '0 ms' : a >= 10 ? a.toFixed(1)+' ms' : a >= 1 ? a.toFixed(2)+' ms' : a.toFixed(3)+' ms';
+}
+
+function updateCalibDisplay() {
+  const who = calib.delay > 0.001 ? 'Front +' : calib.delay < -0.001 ? 'Rear +' : '';
+  const abs = Math.abs(calib.delay);
+  document.getElementById('calib-delay-display').textContent = fmtMs(calib.delay);
+  document.getElementById('calib-delay-display').style.color = calib.delay > 0 ? '#faa' : calib.delay < 0 ? '#aaf' : '#4af';
+  document.getElementById('calib-who-display').textContent   = who ? `${who}${fmtMs(abs)} Offset` : 'kein Offset';
+  document.getElementById('calib-step-display').textContent  = fmtMs(calib.temp);
+  document.getElementById('calib-step-display').style.color  = calib.temp > 10 ? '#fa8' : calib.temp > 2 ? '#ff8' : '#8f8';
+  document.getElementById('calib-steps-display').textContent = calib.steps;
+  const vol = calibVol();
+  document.getElementById('calib-vol-display').textContent = vol + '%';
+}
+
+async function calibStreamCall(action) {
+  const fo = Math.max(0,  calib.delay);
+  const ro = Math.max(0, -calib.delay);
+  await fetch('/calib-stream', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ action, front_offset_ms: fo, rear_offset_ms: ro, volume: calibVol() })
+  });
+}
+
+const calibPlayBtn = document.getElementById('calib-play-btn');
+calibPlayBtn.addEventListener('click', async () => {
+  if (!calib.streaming) {
+    calib.streaming = true;
+    calibPlayBtn.textContent = '⏹ Stream stoppen';
+    calibPlayBtn.style.background = '#3a1a1a';
+    calibPlayBtn.style.color = '#faa';
+    calibPlayBtn.style.borderColor = '#644';
+    await calibStreamCall('start');
+  } else {
+    calib.streaming = false;
+    calibPlayBtn.textContent = '▶ Stream starten';
+    calibPlayBtn.style.background = '#1a3a1a';
+    calibPlayBtn.style.color = '#8f8';
+    calibPlayBtn.style.borderColor = '#464';
+    await calibStreamCall('stop');
+  }
+});
+
+// Update volume display whenever vol slider changes
+document.getElementById('vol-slider')?.addEventListener('input', () => {
+  updateCalibDisplay();
+  if (calib.streaming) calibStreamCall('update');
+});
+
+async function calibAdjust(dir) {
+  const noise = calib.temp * 0.1 * (Math.random() * 2 - 1);
+  const step  = Math.max(calibMinTemp(), calib.temp + noise);
+  calib.delay += dir * step;
+  calib.temp   = Math.max(calibMinTemp(), calib.temp * calibCooling());
+  calib.steps += 1;
+  updateCalibDisplay();
+  document.getElementById('calib-front-btn').disabled = true;
+  document.getElementById('calib-rear-btn').disabled  = true;
+  if (calib.streaming) {
+    await calibStreamCall('update');  // live update, no restart
+  }
+  document.getElementById('calib-front-btn').disabled = false;
+  document.getElementById('calib-rear-btn').disabled  = false;
+  if (calib.temp <= calibMinTemp()) {
+    document.getElementById('calib-status').style.color = '#afa';
+    document.getElementById('calib-status').textContent =
+      `✓ Min-Temp erreicht (${fmtMs(calibMinTemp())}) — bereit zum Übernehmen!`;
+  }
+}
+
+document.getElementById('calib-front-btn').addEventListener('click', () => calibAdjust(+1));
+document.getElementById('calib-rear-btn').addEventListener('click',  () => calibAdjust(-1));
+
+document.getElementById('calib-reset-btn').addEventListener('click', async () => {
+  calib.delay = 0; calib.temp = calibTemp(); calib.steps = 0;
+  updateCalibDisplay();
+  document.getElementById('calib-status').textContent = '';
+  if (calib.streaming) await calibStreamCall('update');
+});
+
+document.getElementById('calib-init-temp').addEventListener('change', () => {
+  if (calib.steps === 0) { calib.temp = calibTemp(); updateCalibDisplay(); }
+});
+
+document.getElementById('calib-sync-btn').addEventListener('click', async () => {
+  const st = document.getElementById('calib-status');
+  if (calib.streaming) { calib.streaming = false; await calibStreamCall('stop'); }
+  const target   = calib.delay >= 0 ? 'front' : 'rear';
+  const delay_ms = parseFloat(Math.abs(calib.delay).toFixed(3));
+  st.style.color = '#fa0'; st.textContent = 'Delay wird angewendet…';
+  try {
+    const res = await fetch('/apply', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ target: delay_ms > 0 ? target : null, delay_ms })
+    });
+    const d = await res.json();
+    st.style.color = d.ok ? '#4c4' : '#f44';
+    st.textContent = d.ok ? `✓ ${delay_ms}ms auf ${target} angewendet!` : d.msg;
+    if (d.ok) {
+      slider.value = delay_ms; targetSel.value = target; updateDisplay();
+      calibPlayBtn.textContent = '▶ Stream starten';
+      calibPlayBtn.style.background = '#1a3a1a'; calibPlayBtn.style.color = '#8f8'; calibPlayBtn.style.borderColor = '#464';
+    }
+  } catch(e) { st.style.color = '#f44'; st.textContent = 'Fehler: ' + e; }
+});
+
+// Stop stream when panel is closed
+document.getElementById('sync-game-panel').addEventListener('toggle', async (e) => {
+  if (!e.target.open && calib.streaming) {
+    calib.streaming = false;
+    await calibStreamCall('stop');
+    calibPlayBtn.textContent = '▶ Stream starten';
+    calibPlayBtn.style.background = '#1a3a1a'; calibPlayBtn.style.color = '#8f8'; calibPlayBtn.style.borderColor = '#464';
+  }
+});
+
+updateCalibDisplay();
+// ── Presets ───────────────────────────────────────────────────────────────────
+function renderPresets(presets) {
+  const list = document.getElementById('presets-list');
+  list.innerHTML = '';
+  const names = Object.keys(presets);
+  if (!names.length) {
+    list.innerHTML = '<div style="color:#555;font-size:0.8rem;text-align:center">Keine Presets gespeichert</div>';
+    return;
+  }
+  names.forEach(name => {
+    const p = presets[name];
+    const info = [
+      p.source || '?',
+      p.mode || '',
+      p.target && p.delay_ms ? `${p.target}+${p.delay_ms}ms` : 'kein Delay',
+    ].filter(Boolean).join(' · ');
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:0.4rem;align-items:center;background:#1a1a1a;border-radius:6px;padding:0.5rem 0.6rem';
+    row.innerHTML = `
+      <div style="flex:1;min-width:0;overflow:hidden">
+        <div style="font-weight:700;color:#ddd;font-size:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${name}</div>
+        <div style="font-size:0.72rem;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${info}</div>
+      </div>
+      <button onclick="loadPreset(${JSON.stringify(name)})"
+        style="padding:0.35rem 0.7rem;background:#1a3a1a;color:#8f8;border:1px solid #464;border-radius:6px;font-size:0.85rem;cursor:pointer;white-space:nowrap;flex-shrink:0">▶ Laden</button>
+      <button onclick="deletePreset(${JSON.stringify(name)})"
+        style="padding:0.35rem 0.55rem;background:#2a1a1a;color:#f88;border:1px solid #644;border-radius:6px;font-size:0.85rem;cursor:pointer;flex-shrink:0">✕</button>
+    `;
+    list.appendChild(row);
+  });
+}
+
+async function loadPreset(name) {
+  const st = document.getElementById('preset-status');
+  st.style.color = '#fa0'; st.textContent = `Lade '${name}'…`;
+  const res = await fetch('/presets/load', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+  const d = await res.json();
+  st.style.color = d.ok ? '#4c4' : '#f44';
+  st.textContent = d.msg;
+  if (d.ok) setTimeout(() => location.reload(), 1500);
+}
+
+async function deletePreset(name) {
+  if (!confirm(`Preset '${name}' löschen?`)) return;
+  const res = await fetch('/presets/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+  const d = await res.json();
+  renderPresets(d.presets || {});
+}
+
+document.getElementById('preset-save-btn').addEventListener('click', async () => {
+  const name = document.getElementById('preset-name-input').value.trim();
+  const st   = document.getElementById('preset-status');
+  if (!name) { st.style.color='#f44'; st.textContent='Name eingeben!'; return; }
+  st.style.color = '#fa0'; st.textContent = 'Speichern…';
+  const res = await fetch('/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+  const d = await res.json();
+  st.style.color = d.ok ? '#4c4' : '#f44';
+  st.textContent = d.msg;
+  if (d.ok) { renderPresets(d.presets); document.getElementById('preset-name-input').value = ''; }
+});
+
+// Load presets on start
+fetch('/presets').then(r => r.json()).then(d => renderPresets(d.presets || {}));
+</script>
+</body>
+</html>
+"""
+
+# ── Remote HTML (phone-optimized) ─────────────────────────────────────────────
+
+REMOTE_HTML = """\
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Remote</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding: 1.5rem 1rem;
+    user-select: none;
+  }
+  h1 { font-size: 1.2rem; margin-bottom: 1.5rem; color: #888; }
+  .card {
+    background: #1e1e1e;
+    border: 1px solid #333;
+    border-radius: 16px;
+    padding: 1.5rem;
+    width: 100%;
+    max-width: 400px;
+  }
+
+  /* Track info */
+  .track-info {
+    text-align: center;
+    margin-bottom: 1.5rem;
+    min-height: 4rem;
+  }
+  .track-title {
+    font-size: 1.2rem;
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .track-artist {
+    font-size: 0.95rem;
+    color: #aaa;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .track-album {
+    font-size: 0.8rem;
+    color: #666;
+    margin-top: 0.2rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .track-status {
+    font-size: 0.75rem;
+    color: #555;
+    margin-top: 0.4rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  /* Transport controls */
+  .transport {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 1.2rem;
+    margin-bottom: 2rem;
+  }
+  .transport button {
+    background: none;
+    border: none;
+    color: #eee;
+    cursor: pointer;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s;
+  }
+  .transport button:active { background: #333; }
+  .btn-skip { width: 56px; height: 56px; font-size: 1.8rem; }
+  .btn-play {
+    width: 72px;
+    height: 72px;
+    font-size: 2.2rem;
+    background: #4af !important;
+    color: #000 !important;
+  }
+  .btn-play:active { background: #3ae !important; }
+
+  /* Volume */
+  .vol-section { margin-bottom: 0.5rem; }
+  .vol-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+  .vol-label span { font-size: 0.85rem; color: #aaa; }
+  .vol-pct {
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: #4c4;
+  }
+  input[type=range] {
+    width: 100%;
+    height: 40px;
+    accent-color: #4c4;
+    cursor: pointer;
+    touch-action: none;
+  }
+  .vol-btns {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.8rem;
+  }
+  .vol-btns button {
+    flex: 1;
+    padding: 0.8rem;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: #2a2a2a;
+    color: #aaa;
+    font-size: 1.1rem;
+    cursor: pointer;
+  }
+  .vol-btns button:active { background: #383838; }
+
+  .divider {
+    border: none;
+    border-top: 1px solid #333;
+    margin: 1.5rem 0;
+  }
+
+  .back-link {
+    display: block;
+    text-align: center;
+    margin-top: 1rem;
+    color: #555;
+    font-size: 0.8rem;
+    text-decoration: none;
+  }
+  .back-link:hover { color: #888; }
+</style>
+</head>
+<body>
+<h1>📱 Remote</h1>
+
+<div class="card">
+  <div class="track-info">
+    <div class="track-title" id="track-title">—</div>
+    <div class="track-artist" id="track-artist"></div>
+    <div class="track-album" id="track-album"></div>
+    <div class="track-status" id="track-status">Stopped</div>
+  </div>
+
+  <div class="transport">
+    <button class="btn-skip" onclick="playerCmd('previous')" title="Previous">⏮</button>
+    <button class="btn-play" id="play-btn" onclick="playerCmd('play-pause')" title="Play/Pause">⏯</button>
+    <button class="btn-skip" onclick="playerCmd('next')" title="Next">⏭</button>
+  </div>
+
+  <hr class="divider">
+
+  <div class="vol-section">
+    <div class="vol-label">
+      <span>🔉 Volume</span>
+      <span class="vol-pct" id="vol-pct">—</span>
+    </div>
+    <input type="range" id="vol-range" min="0" max="100" step="1" value="50">
+    <div class="vol-btns">
+      <button onclick="volStep(-5)">− 5</button>
+      <button onclick="volStep(-1)">− 1</button>
+      <button id="mute-btn" onclick="toggleMute()">🔇</button>
+      <button onclick="volStep(+1)">+ 1</button>
+      <button onclick="volStep(+5)">+ 5</button>
+    </div>
+  </div>
+</div>
+
+<a href="/" class="back-link">← Audio Sync Settings</a>
+
+<script>
+const volRange = document.getElementById('vol-range');
+const volPct   = document.getElementById('vol-pct');
+const muteBtn  = document.getElementById('mute-btn');
+const playBtn  = document.getElementById('play-btn');
+let volTimeout = null;
+let isMuted = false;
+
+// ── Volume ──
+function updateVolUI(v, muted) {
+  volRange.value = v;
+  volPct.textContent = v + '%';
+  isMuted = muted;
+  muteBtn.textContent = muted ? '🔊' : '🔇';
+}
+
+volRange.addEventListener('input', () => {
+  volPct.textContent = volRange.value + '%';
+  clearTimeout(volTimeout);
+  volTimeout = setTimeout(() => {
+    fetch('/volume', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({volume: parseInt(volRange.value)})
+    });
+  }, 80);
+});
+
+function volStep(delta) {
+  let v = parseInt(volRange.value) + delta;
+  v = Math.max(0, Math.min(100, v));
+  volRange.value = v;
+  volPct.textContent = v + '%';
+  fetch('/volume', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({volume: v})
+  });
+}
+
+function toggleMute() {
+  fetch('/volume', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mute_toggle: true})
+  }).then(r => r.json()).then(d => updateVolUI(d.volume, d.muted));
+}
+
+// ── Player ──
+function playerCmd(action) {
+  fetch('/player', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action})
+  }).then(() => setTimeout(pollPlayer, 300));
+}
+
+function pollPlayer() {
+  fetch('/player-status').then(r => r.json()).then(d => {
+    document.getElementById('track-title').textContent = d.title || '—';
+    document.getElementById('track-artist').textContent = d.artist || '';
+    document.getElementById('track-album').textContent = d.album || '';
+    document.getElementById('track-status').textContent = d.status || 'Stopped';
+    playBtn.textContent = d.status === 'Playing' ? '⏸' : '▶';
+  });
+}
+
+// ── Init & polling ──
+fetch('/volume').then(r => r.json()).then(d => updateVolUI(d.volume, d.muted));
+pollPlayer();
+setInterval(pollPlayer, 3000);
+setInterval(() => {
+  fetch('/volume').then(r => r.json()).then(d => updateVolUI(d.volume, d.muted));
+}, 5000);
+</script>
+</body>
+</html>
+"""
+
+# ── Debug HTML ────────────────────────────────────────────────────────────────
+
+DEBUG_HTML = """\
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Speaker Debug</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 1.5rem 1rem;
+    user-select: none;
+  }
+  h1 { font-size: 1.2rem; margin-bottom: 0.3rem; }
+  .sub { color: #666; font-size: 0.8rem; margin-bottom: 1.5rem; }
+  .card {
+    background: #1e1e1e;
+    border: 1px solid #333;
+    border-radius: 16px;
+    padding: 1.5rem;
+    width: 100%;
+    max-width: 440px;
+    margin-bottom: 1rem;
+  }
+  .section-label {
+    font-size: 0.85rem;
+    color: #aaa;
+    margin-bottom: 0.8rem;
+    display: block;
+  }
+  .speaker-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  .speaker {
+    background: #252525;
+    border: 1px solid #333;
+    border-radius: 12px;
+    padding: 1rem;
+    text-align: center;
+  }
+  .speaker.active { border-color: #4c4; }
+  .speaker-name {
+    font-size: 0.75rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.5rem;
+  }
+  .speaker-vol {
+    font-size: 1.8rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+  }
+  .speaker-vol.fl { color: #4af; }
+  .speaker-vol.fr { color: #4af; }
+  .speaker-vol.rl { color: #f90; }
+  .speaker-vol.rr { color: #f90; }
+  input[type=range] {
+    width: 100%;
+    height: 36px;
+    cursor: pointer;
+    touch-action: none;
+  }
+  .slider-front { accent-color: #4af; }
+  .slider-rear { accent-color: #f90; }
+  .divider {
+    border: none;
+    border-top: 1px solid #333;
+    margin: 1.2rem 0;
+  }
+  .test-btns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+  }
+  .test-btn {
+    padding: 0.8rem;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: #2a2a2a;
+    color: #aaa;
+    font-size: 0.9rem;
+    cursor: pointer;
+    text-align: center;
+  }
+  .test-btn:active { background: #383838; }
+  .test-btn.all {
+    grid-column: span 2;
+    background: #333;
+    color: #eee;
+  }
+  .reset-btn {
+    width: 100%;
+    margin-top: 0.8rem;
+    padding: 0.7rem;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: #2a2a2a;
+    color: #aaa;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  .back-link {
+    display: block;
+    text-align: center;
+    margin-top: 0.5rem;
+    color: #555;
+    font-size: 0.8rem;
+    text-decoration: none;
+  }
+  .back-link:hover { color: #888; }
+  #status {
+    margin-top: 0.8rem;
+    font-size: 0.8rem;
+    color: #888;
+    text-align: center;
+    min-height: 1em;
+  }
+  #status.ok { color: #4c4; }
+</style>
+</head>
+<body>
+<h1>🔧 Speaker Debug</h1>
+<p class="sub">Individual speaker volume &amp; test</p>
+
+<div class="card">
+  <span class="section-label">Individual Volumes</span>
+  <div class="speaker-grid">
+    <div class="speaker" id="sp-fl">
+      <div class="speaker-name">Front Left</div>
+      <div class="speaker-vol fl" id="vol-fl">100%</div>
+      <input type="range" class="slider-front" id="sl-fl" min="0" max="100" value="100">
+    </div>
+    <div class="speaker" id="sp-fr">
+      <div class="speaker-name">Front Right</div>
+      <div class="speaker-vol fr" id="vol-fr">100%</div>
+      <input type="range" class="slider-front" id="sl-fr" min="0" max="100" value="100">
+    </div>
+    <div class="speaker" id="sp-rl">
+      <div class="speaker-name">Rear Left</div>
+      <div class="speaker-vol rl" id="vol-rl">100%</div>
+      <input type="range" class="slider-rear" id="sl-rl" min="0" max="100" value="100">
+    </div>
+    <div class="speaker" id="sp-rr">
+      <div class="speaker-name">Rear Right</div>
+      <div class="speaker-vol rr" id="vol-rr">100%</div>
+      <input type="range" class="slider-rear" id="sl-rr" min="0" max="100" value="100">
+    </div>
+  </div>
+
+  <button class="reset-btn" onclick="resetAll()">↺ Reset All to 100%</button>
+
+  <hr class="divider">
+
+  <span class="section-label">Test Tone (sine 440Hz, 2s)</span>
+  <div class="test-btns">
+    <button class="test-btn" onclick="testSpeaker('fl')">🔊 Front Left</button>
+    <button class="test-btn" onclick="testSpeaker('fr')">🔊 Front Right</button>
+    <button class="test-btn" onclick="testSpeaker('rl')">🔊 Rear Left</button>
+    <button class="test-btn" onclick="testSpeaker('rr')">🔊 Rear Right</button>
+    <button class="test-btn all" onclick="testSpeaker('all')">🔊 All Speakers</button>
+  </div>
+
+  <div id="status"></div>
+</div>
+
+<a href="/" class="back-link">← Back to Settings</a>
+
+<script>
+const sliders = {
+  fl: document.getElementById('sl-fl'),
+  fr: document.getElementById('sl-fr'),
+  rl: document.getElementById('sl-rl'),
+  rr: document.getElementById('sl-rr')
+};
+const displays = {
+  fl: document.getElementById('vol-fl'),
+  fr: document.getElementById('vol-fr'),
+  rl: document.getElementById('vol-rl'),
+  rr: document.getElementById('vol-rr')
+};
+const status = document.getElementById('status');
+let debounce = null;
+
+function sendVolumes() {
+  clearTimeout(debounce);
+  debounce = setTimeout(() => {
+    fetch('/debug-volume', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        fl: parseInt(sliders.fl.value),
+        fr: parseInt(sliders.fr.value),
+        rl: parseInt(sliders.rl.value),
+        rr: parseInt(sliders.rr.value)
+      })
+    });
+  }, 80);
+}
+
+Object.keys(sliders).forEach(ch => {
+  sliders[ch].addEventListener('input', () => {
+    displays[ch].textContent = sliders[ch].value + '%';
+    sendVolumes();
+  });
+});
+
+function resetAll() {
+  Object.keys(sliders).forEach(ch => {
+    sliders[ch].value = 100;
+    displays[ch].textContent = '100%';
+  });
+  sendVolumes();
+}
+
+function testSpeaker(ch) {
+  status.className = '';
+  status.textContent = 'Playing test tone…';
+  fetch('/debug-test', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({channel: ch})
+  }).then(r => r.json()).then(d => {
+    status.className = 'ok';
+    status.textContent = d.msg || 'Done';
+  }).catch(() => {
+    status.textContent = 'Error';
+  });
+}
+</script>
+</body>
+</html>
+"""
+
+# ── HTTP handler ──────────────────────────────────────────────────────────────
+
+_apply_lock = threading.Lock()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass  # suppress access log
+
+    def send_json(self, code, data):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/state":
+            self.send_json(200, load_state())
+        elif self.path == "/volume":
+            self.send_json(200, get_master_volume())
+        elif self.path == "/player-status":
+            self.send_json(200, get_player_status())
+        elif self.path == "/network-status":
+            status = get_scream_status()
+            status["config"] = get_network_config()
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                status["pi_ip"] = s.getsockname()[0]
+                s.close()
+            except Exception:
+                status["pi_ip"] = "?"
+            status["hostname"] = os.uname().nodename
+            # List network interfaces with IPv4 addresses
+            ifaces = []
+            try:
+                import json as _json
+                out = subprocess.check_output(["ip", "-j", "addr", "show"], text=True)
+                for iface in _json.loads(out):
+                    name = iface.get("ifname", "")
+                    addrs = [a["local"] for a in iface.get("addr_info", []) if a.get("family") == "inet"]
+                    if addrs and name != "lo":
+                        ifaces.append({"name": name, "ip": addrs[0]})
+            except Exception:
+                pass
+            status["interfaces"] = ifaces
+            self.send_json(200, status)
+        elif self.path == "/presets":
+            self.send_json(200, {"ok": True, "presets": get_presets()})
+        elif self.path == "/remote":
+            body = REMOTE_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/debug":
+            body = DEBUG_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/display-state":
+            try:
+                with urllib.request.urlopen("http://localhost:8084/state", timeout=2) as r:
+                    self.send_json(200, json.loads(r.read()))
+            except Exception:
+                self.send_json(200, {"mode": "off", "overlay_enabled": True,
+                                     "visualizer_mirror": False,
+                                     "status": "daemon_down", "track": None})
+        else:
+            body = HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path not in ("/apply", "/balance", "/mode", "/volume", "/player", "/debug-volume", "/debug-test", "/source", "/network-config", "/buffers", "/restart-service", "/play-sync-test", "/calib-stream", "/presets", "/presets/load", "/presets/delete", "/hdmi", "/power", "/display"):
+            self.send_json(404, {"ok": False, "msg": "not found"})
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_json(400, {"ok": False, "msg": "bad JSON"})
+            return
+
+        if self.path == "/balance":
+            balance = int(data.get("balance", 0))
+            if balance < -100 or balance > 100:
+                self.send_json(400, {"ok": False, "msg": "balance out of range (-100…+100)"})
+                return
+            with _apply_lock:
+                state = load_state()
+                state["balance"] = balance
+                save_state(state)
+                try:
+                    apply_balance(balance)
+                except subprocess.CalledProcessError as e:
+                    self.send_json(500, {"ok": False, "msg": str(e)})
+                    return
+            if balance == 0:
+                msg = "Balance: Gleich (beide 100%)"
+            elif balance < 0:
+                msg = f"Front 100% / Rear {100 + balance}%"
+            else:
+                msg = f"Front {100 - balance}% / Rear 100%"
+            self.send_json(200, {"ok": True, "msg": msg})
+            return
+
+        if self.path == "/mode":
+            mode = data.get("mode", "stereo")
+            if mode not in ("stereo", "surround"):
+                self.send_json(400, {"ok": False, "msg": "invalid mode (stereo|surround)"})
+                return
+            with _apply_lock:
+                state = load_state()
+                state["mode"] = mode
+                save_state(state)
+                try:
+                    apply_state(state)
+                except subprocess.CalledProcessError as e:
+                    self.send_json(500, {"ok": False, "msg": str(e)})
+                    return
+            label = "Surround 4.0 (FL/FR → Front, RL/RR → Rear)" if mode == "surround" else "Stereo (beide Outputs gleich)"
+            self.send_json(200, {"ok": True, "msg": f"Modus: {label}"})
+            return
+
+        if self.path == "/source":
+            source = data.get("source", "bluetooth")
+            if source not in ("bluetooth", "local", "usb", "network"):
+                self.send_json(400, {"ok": False, "msg": "invalid source (bluetooth|local|usb|network)"})
+                return
+            with _apply_lock:
+                state = load_state()
+                state["source"] = source
+                save_state(state)
+                try:
+                    set_source(source)
+                except Exception as e:
+                    self.send_json(500, {"ok": False, "msg": str(e)})
+                    return
+            labels = {
+                "bluetooth": "Bluetooth (A2DP)",
+                "local": "Lokale Wiedergabe",
+                "usb": "USB Line-In (UFO202 → Speakers)",
+                "network": "Netzwerk (Scream empfängt von Windows)"
+            }
+            self.send_json(200, {"ok": True, "msg": f"Quelle: {labels.get(source, source)}"})
+            return
+
+        if self.path == "/network-config":
+            nc = {
+                "group": str(data.get("group", "239.255.77.77")).strip(),
+                "port": int(data.get("port", 4010)),
+                "iface": str(data.get("iface", "")).strip(),
+                "unicast": bool(data.get("unicast", False)),
+                "rate": int(data.get("rate", 48000)),
+                "format": str(data.get("format", "s16")).strip(),
+            }
+            if nc["port"] < 1 or nc["port"] > 65535:
+                self.send_json(400, {"ok": False, "msg": "Port muss zwischen 1 und 65535 liegen"})
+                return
+            if nc["rate"] not in (44100, 48000, 96000, 192000):
+                self.send_json(400, {"ok": False, "msg": "Ungültige Sample Rate"})
+                return
+            if nc["format"] not in ("s16", "s32", "f32"):
+                self.send_json(400, {"ok": False, "msg": "Ungültiges Format"})
+                return
+            with _apply_lock:
+                state = load_state()
+                state["network_config"] = nc
+                save_state(state)
+                # Restart receiver if network source is active
+                if state.get("source") == "network":
+                    try:
+                        start_scream_receiver(nc)
+                    except Exception as e:
+                        self.send_json(500, {"ok": False, "msg": str(e)})
+                        return
+            restart_msg = " Receiver neu gestartet." if state.get("source") == "network" else ""
+            self.send_json(200, {"ok": True, "msg": f"Netzwerk-Konfiguration gespeichert.{restart_msg}", "config": nc})
+            return
+
+        if self.path == "/buffers":
+            front_buf = int(data.get("front", 2048))
+            rear_buf  = int(data.get("rear", 512))
+            state = load_state()
+            state["buffer_front"] = front_buf
+            state["buffer_rear"]  = rear_buf
+            save_state(state)
+            with _apply_lock:
+                apply_buffers(front_buf, rear_buf)
+                subprocess.run(["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"], check=False)
+                time.sleep(3)
+                apply_state(state)
+            self.send_json(200, {"ok": True, "msg": f"Buffer: Front={front_buf}, Rear={rear_buf}. PipeWire neu gestartet."})
+            return
+
+        if self.path == "/restart-service":
+            svc   = data.get("service", "")
+            scope = data.get("scope", "user")
+            ALLOWED_USER   = {"pipewire", "pipewire-pulse", "wireplumber", "audio-sync-web", "dlna-renderer", "cast-receiver"}
+            ALLOWED_SYSTEM = {"bluetooth"}
+            ALL_SERVICES   = [
+                ("user",   "pipewire pipewire-pulse wireplumber"),
+                ("user",   "dlna-renderer"),
+                ("system", "bluetooth"),
+                ("user",   "audio-sync-web"),
+            ]
+            try:
+                if svc == "ALL":
+                    # Restart everything except audio-sync-web first, then send response,
+                    # then restart audio-sync-web in background so the connection isn't dropped.
+                    for sc, svcs in ALL_SERVICES:
+                        if "audio-sync-web" in svcs:
+                            continue
+                        flag = "--user" if sc == "user" else "--system"
+                        subprocess.run(["systemctl", flag, "restart"] + svcs.split(), check=False)
+                        time.sleep(1)
+                    self.send_json(200, {"ok": True, "msg": "Alle Services neu gestartet. Web UI startet gleich neu…"})
+                    def _restart_self():
+                        time.sleep(1)
+                        subprocess.run(["systemctl", "--user", "restart", "audio-sync-web"], check=False)
+                    threading.Thread(target=_restart_self, daemon=True).start()
+                else:
+                    parts = svc.split()
+                    if scope == "system":
+                        allowed = ALLOWED_SYSTEM
+                    else:
+                        allowed = ALLOWED_USER
+                    if not all(p in allowed for p in parts):
+                        self.send_json(400, {"ok": False, "msg": f"Service nicht erlaubt: {svc}"})
+                        return
+                    flag = "--user" if scope == "user" else "--system"
+                    subprocess.run(["systemctl", flag, "restart"] + parts, check=False)
+                    self.send_json(200, {"ok": True, "msg": f"{svc} neu gestartet."})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "msg": str(e)})
+            return
+
+        if self.path == "/play-sync-test":
+            try:
+                fo = float(data.get("front_offset_ms", 0))
+                ro = float(data.get("rear_offset_ms",  0))
+                threading.Thread(target=play_sync_test, args=(fo, ro), daemon=True).start()
+                self.send_json(200, {"ok": True})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "msg": str(e)})
+            return
+
+        if self.path == "/calib-stream":
+            action = data.get("action", "update")  # start | stop | update
+            fo  = float(data.get("front_offset_ms", 0))
+            ro  = float(data.get("rear_offset_ms",  0))
+            vol = float(data.get("volume", 70))
+            try:
+                if action == "start":
+                    threading.Thread(target=start_calib_stream, args=(fo, ro, vol), daemon=True).start()
+                elif action == "stop":
+                    stop_calib_stream()
+                else:  # update
+                    update_calib_offset(fo, ro, vol)
+                self.send_json(200, {"ok": True, "streaming": not _calib_stop.is_set()})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "msg": str(e)})
+            return
+
+        if self.path == "/presets":
+            name = data.get("name", "").strip()
+            if not name:
+                self.send_json(400, {"ok": False, "msg": "Name fehlt"})
+                return
+            save_preset(name, load_state())
+            self.send_json(200, {"ok": True, "msg": f"Preset '{name}' gespeichert.", "presets": get_presets()})
+            return
+
+        if self.path == "/presets/load":
+            name = data.get("name", "")
+            ok, msg = load_preset(name)
+            self.send_json(200 if ok else 404, {"ok": ok, "msg": msg})
+            return
+
+        if self.path == "/presets/delete":
+            name = data.get("name", "")
+            delete_preset(name)
+            self.send_json(200, {"ok": True, "msg": f"Preset '{name}' gelöscht.", "presets": get_presets()})
+            return
+
+        if self.path == "/hdmi":
+            enabled    = bool(data.get("enabled", False))
+            port       = int(data.get("port", 0))
+            front_rear = data.get("outputs_front_rear", None)
+            if port not in (0, 1):
+                self.send_json(400, {"ok": False, "msg": "invalid port (0|1)"})
+                return
+            with _apply_lock:
+                state = load_state()
+                state["hdmi_enabled"] = enabled
+                state["hdmi_port"]    = port
+                if front_rear is not None:
+                    state["outputs_front_rear"] = bool(front_rear)
+                # Safety: ensure at least one output is active
+                if not state.get("outputs_front_rear", True) and not enabled:
+                    state["outputs_front_rear"] = True
+                save_state(state)
+                try:
+                    apply_state(state)
+                except subprocess.CalledProcessError as e:
+                    self.send_json(500, {"ok": False, "msg": str(e)})
+                    return
+            parts = []
+            if state.get("outputs_front_rear", True):
+                parts.append("Front+Rear")
+            if enabled:
+                h0, h1 = detect_hdmi_sinks()
+                parts.append(f"HDMI {port} ({h0 if port == 0 else h1})")
+            self.send_json(200, {"ok": True, "msg": f"Outputs: {', '.join(parts)}. PipeWire neu gestartet."})
+            return
+
+        if self.path == "/power":
+            action = data.get("action", "")
+            if action not in ("stop", "start"):
+                self.send_json(400, {"ok": False, "msg": "invalid action (stop|start)"})
+                return
+            POWER_USER   = ["pipewire", "pipewire-pulse", "wireplumber", "dlna-renderer"]
+            POWER_SYSTEM = ["bluetooth"]
+            try:
+                if action == "stop":
+                    stop_usb_loopback()
+                    stop_scream_receiver()
+                    stop_calib_stream()
+                    subprocess.run(["systemctl", "--user", "stop"] + POWER_USER, check=False)
+                    subprocess.run(["sudo", "systemctl", "stop"] + POWER_SYSTEM, check=False)
+                    self.send_json(200, {"ok": True, "msg": "System gestoppt. Web UI läuft weiter."})
+                else:
+                    subprocess.run(["systemctl", "--user", "start"] + POWER_USER, check=False)
+                    subprocess.run(["sudo", "systemctl", "start"] + POWER_SYSTEM, check=False)
+                    time.sleep(3)
+                    state = load_state()
+                    try:
+                        with _apply_lock:
+                            apply_state(state)
+                    except Exception:
+                        pass
+                    src = state.get("source", "bluetooth")
+                    if src in ("usb", "network"):
+                        try:
+                            set_source(src)
+                        except Exception:
+                            pass
+                    self.send_json(200, {"ok": True, "msg": "System gestartet und State wiederhergestellt."})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "msg": str(e)})
+            return
+
+        if self.path == "/display":
+            try:
+                req = urllib.request.Request(
+                    "http://localhost:8084/set", data=body,
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=2) as r:
+                    self.send_json(r.getcode(), json.loads(r.read()))
+            except Exception as e:
+                self.send_json(502, {"ok": False, "msg": str(e)})
+            return
+
+        if self.path == "/volume":
+            if data.get("mute_toggle"):
+                toggle_mute()
+                self.send_json(200, {**get_master_volume(), "ok": True})
+                return
+            vol = int(data.get("volume", 50))
+            vol = max(0, min(150, vol))
+            set_master_volume(vol)
+            self.send_json(200, {"ok": True, "volume": vol})
+            return
+
+        if self.path == "/player":
+            action = data.get("action", "")
+            if action not in ("play-pause", "next", "previous", "play", "pause"):
+                self.send_json(400, {"ok": False, "msg": "invalid action"})
+                return
+            try:
+                player_cmd(action)
+                self.send_json(200, {"ok": True, "msg": action})
+            except subprocess.CalledProcessError:
+                self.send_json(200, {"ok": True, "msg": "no player"})
+            return
+
+        if self.path == "/debug-volume":
+            fl = max(0, min(100, int(data.get("fl", 100))))
+            fr = max(0, min(100, int(data.get("fr", 100))))
+            rl = max(0, min(100, int(data.get("rl", 100))))
+            rr = max(0, min(100, int(data.get("rr", 100))))
+            try:
+                set_speaker_volumes(fl, fr, rl, rr)
+                self.send_json(200, {"ok": True, "fl": fl, "fr": fr, "rl": rl, "rr": rr})
+            except subprocess.CalledProcessError as e:
+                self.send_json(500, {"ok": False, "msg": str(e)})
+            return
+
+        if self.path == "/debug-test":
+            ch = data.get("channel", "all")
+            # speaker-test channel numbers: 1=FL, 2=FR, 3=RL, 4=RR
+            ch_map = {"fl": "1", "fr": "2", "rl": "3", "rr": "4"}
+            try:
+                if ch == "all":
+                    subprocess.run(
+                        ["speaker-test", "-D", "pulse", "-c", "4", "-t", "sine", "-l", "1", "-p", "500"],
+                        timeout=10, check=True, capture_output=True
+                    )
+                elif ch in ch_map:
+                    subprocess.run(
+                        ["speaker-test", "-D", "pulse", "-c", "4", "-t", "sine", "-s", ch_map[ch], "-l", "1"],
+                        timeout=5, check=True, capture_output=True
+                    )
+                else:
+                    self.send_json(400, {"ok": False, "msg": "invalid channel"})
+                    return
+                self.send_json(200, {"ok": True, "msg": f"Test {ch} done"})
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                self.send_json(200, {"ok": True, "msg": f"Test {ch} finished"})
+            return
+
+        target   = data.get("target")   # "front" | "rear" | None
+        delay_ms = float(data.get("delay_ms", 0))
+
+        if target not in (None, "front", "rear"):
+            self.send_json(400, {"ok": False, "msg": "invalid target"})
+            return
+        if delay_ms < 0 or delay_ms > 500:
+            self.send_json(400, {"ok": False, "msg": "delay out of range (0–500ms)"})
+            return
+
+        with _apply_lock:
+            state = load_state()
+            state["target"] = target if delay_ms > 0 else None
+            state["delay_ms"] = delay_ms
+            save_state(state)
+            try:
+                apply_state(state)
+            except subprocess.CalledProcessError as e:
+                self.send_json(500, {"ok": False, "msg": str(e)})
+                return
+
+        if not target or delay_ms == 0:
+            msg = "Kein Delay — auto latency-compensate aktiv."
+        else:
+            label = "3.5mm Front" if target == "front" else "USB Rear"
+            msg   = f"{label} +{delay_ms}ms Delay angewendet."
+
+        self.send_json(200, {"ok": True, "msg": msg})
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Restore source on startup (e.g. after service restart)
+    try:
+        state = load_state()
+        # Ensure ALSA buffer lua rules match saved config
+        front_buf = state.get("buffer_front", 2048)
+        rear_buf  = state.get("buffer_rear", 512)
+        apply_buffers(front_buf, rear_buf)
+        src = state.get("source", "bluetooth")
+        if src in ("usb", "network"):
+            set_source(src)
+    except Exception:
+        pass
+    port = 8083
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"Audio Sync UI → http://pi8:{port}  (Ctrl+C zum Beenden)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")

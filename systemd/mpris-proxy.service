@@ -1,0 +1,11 @@
+[Unit]
+Description=BlueZ AVRCP to MPRIS2 bridge
+After=bluetooth.target
+
+[Service]
+ExecStart=/usr/bin/mpris-proxy
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
