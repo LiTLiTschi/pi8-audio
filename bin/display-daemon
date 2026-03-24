@@ -60,7 +60,6 @@ _state  = {"mode": "off", "overlay_enabled": True, "visualizer_mirror": False, "
 _track  = {"title": "", "artist": "", "artUrl": ""}
 _g      = {"status": "idle"}   # volatile string; use dict to avoid global rebind issues
 _queue  : queue.Queue = queue.Queue()
-_clock_timer: threading.Timer = None
 
 
 # ── Event types ───────────────────────────────────────────────────────────────
@@ -430,7 +429,10 @@ def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album="",
     if not resolved_url and (artist or title):
         resolved_url = get_cover_art(artist, title, album)
 
-    if resolved_url and resolved_url != _last_art_url[0]:
+    if not resolved_url:
+        _cover_cache[0] = None
+        _last_art_url[0] = ""
+    elif resolved_url != _last_art_url[0]:
         try:
             urllib.request.urlretrieve(resolved_url, COVER_FILE)
             _cover_cache[0] = Image.open(COVER_FILE).convert("RGB")
@@ -602,22 +604,23 @@ def mpris_metadata_watcher():
     if not shutil.which("playerctl"):
         log.warning("playerctl not found — metadata watcher disabled")
         return
-    debounce = [None]
-    buf: dict = {}
-
-    def flush():
-        title  = buf.get("xesam:title",  "").strip()
-        artist = buf.get("xesam:artist", "").strip()
-        album  = buf.get("xesam:album",  "").strip()
-        artUrl = buf.get("mpris:artUrl", "").strip()
-        # strip array: ['Queen'] or ['A', 'B'] → A, B
-        if artist.startswith("[") and artist.endswith("]"):
-            inner = artist[1:-1]
-            artist = ", ".join(p.strip("'\" ") for p in inner.split(","))
-        log.debug("metadata flush: title=%r artist=%r artUrl=%r", title, artist, artUrl)
-        _queue.put(MetadataEvent(title, artist, artUrl, album))
 
     while True:
+        debounce = [None]
+        buf: dict = {}
+
+        def flush():
+            title  = buf.get("xesam:title",  "").strip()
+            artist = buf.get("xesam:artist", "").strip()
+            album  = buf.get("xesam:album",  "").strip()
+            artUrl = buf.get("mpris:artUrl", "").strip()
+            # strip array: ['Queen'] or ['A', 'B'] → A, B
+            if artist.startswith("[") and artist.endswith("]"):
+                inner = artist[1:-1]
+                artist = ", ".join(p.strip("'\" ") for p in inner.split(","))
+            log.debug("metadata flush: title=%r artist=%r artUrl=%r", title, artist, artUrl)
+            _queue.put(MetadataEvent(title, artist, artUrl, album))
+
         try:
             proc = subprocess.Popen(
                 ["playerctl", "-F", "metadata"],
@@ -635,6 +638,8 @@ def mpris_metadata_watcher():
             proc.wait()
         except Exception as e:
             log.warning("playerctl watcher error: %s", e)
+        if debounce[0]:
+            debounce[0].cancel()
         time.sleep(2)
 
 
@@ -670,6 +675,7 @@ def display_controller():
     old_frame    = [None]
     skip_count   = [0]
     lyrics_thread = [None]
+    clock_timer  = [None]
 
     # ── chvt ──────────────────────────────────────────────────────────────────
     def chvt(n):
@@ -809,11 +815,10 @@ def display_controller():
 
     # ── mode transitions ───────────────────────────────────────────────────────
     def teardown(mode):
-        global _clock_timer
         if mode == "now-playing":
-            if _clock_timer:
-                _clock_timer.cancel()
-                _clock_timer = None
+            if clock_timer[0]:
+                clock_timer[0].cancel()
+                clock_timer[0] = None
             # Stop lyrics updater thread
             lyrics_stop.set()
             if lyrics_thread[0] and lyrics_thread[0].is_alive():
@@ -854,10 +859,9 @@ def display_controller():
     _rendering = [False]
 
     def do_render(ev):
-        global _clock_timer
-        if _clock_timer:
-            _clock_timer.cancel()
-            _clock_timer = None
+        if clock_timer[0]:
+            clock_timer[0].cancel()
+            clock_timer[0] = None
         if _rendering[0]:
             return
         _rendering[0] = True
@@ -904,11 +908,11 @@ def display_controller():
         if not url:
             skip_count[0] += 1
             if skip_count[0] >= 5:
-                skip_count[0] = 0
                 with _lock:
                     _state["mode"] = "now-playing"
                     _g["status"] = "no_videos_found"
                 save_state(dict(_state))
+                skip_count[0] = 0
                 _queue.put(ModeChangeEvent("now-playing",
                                            _state.get("overlay_enabled", True),
                                            _state.get("visualizer_mirror", False)))
@@ -982,12 +986,11 @@ def display_controller():
                 do_render(t)
 
         elif isinstance(ev, StatusEvent):
-            global _clock_timer
             with _lock:
                 _g["status"] = ev.status.lower() if ev.status else "idle"
             # Start clock timer when idle in now-playing mode
             if current_mode == "now-playing" and ev.status in ("Paused", "Stopped", ""):
-                if _clock_timer is None or not _clock_timer.is_alive():
+                if clock_timer[0] is None or not clock_timer[0].is_alive():
                     def _show_clock():
                         try:
                             frame = render_clock_frame(W, H)
@@ -995,13 +998,13 @@ def display_controller():
                             mpv_loadfile(NP_FILE, loop=True)
                         except Exception as e:
                             log.debug("clock render failed: %s", e)
-                    _clock_timer = threading.Timer(60.0, _show_clock)
-                    _clock_timer.daemon = True
-                    _clock_timer.start()
+                    clock_timer[0] = threading.Timer(60.0, _show_clock)
+                    clock_timer[0].daemon = True
+                    clock_timer[0].start()
             elif ev.status == "Playing":
-                if _clock_timer:
-                    _clock_timer.cancel()
-                    _clock_timer = None
+                if clock_timer[0]:
+                    clock_timer[0].cancel()
+                    clock_timer[0] = None
             # Legacy behaviour for Stopped/""
             if ev.status in ("Stopped", ""):
                 with _lock: _g["status"] = "idle"
