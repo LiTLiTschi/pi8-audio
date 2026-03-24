@@ -120,7 +120,39 @@ def get_player_status():
             info[field] = val
         except subprocess.CalledProcessError:
             pass
+    try:
+        pos_out = subprocess.run(["playerctl", "position"], capture_output=True, text=True, timeout=2)
+        pos = float(pos_out.stdout.strip()) if pos_out.returncode == 0 else 0.0
+    except Exception:
+        pos = 0.0
+    try:
+        len_out = subprocess.run(["playerctl", "metadata", "mpris:length"], capture_output=True, text=True, timeout=2)
+        # mpris:length is in microseconds
+        length = int(len_out.stdout.strip()) / 1_000_000 if len_out.returncode == 0 else 0.0
+    except Exception:
+        length = 0.0
+    info["position"] = pos
+    info["duration"] = length
     return info
+
+
+def _sleep_timer_fire():
+    try:
+        subprocess.run(["playerctl", "pause"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    try:
+        req = urllib.request.Request(
+            "http://localhost:8084/set",
+            data=json.dumps({"mode": "off"}).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
+    with _sleep_timer_lock:
+        global _sleep_timer, _sleep_timer_end
+        _sleep_timer = None
+        _sleep_timer_end = 0.0
 
 
 def set_speaker_volumes(front_left, front_right, rear_left, rear_right):
@@ -1194,6 +1226,21 @@ HTML = """\
         <label style="font-size:0.9rem;color:#ccc"><input type="checkbox" id="disp-mirror" onchange="applyDisplayOptions()"> Mirror bars</label>
       </div>
       <div id="disp-status" style="font-size:0.8rem;color:#888;min-height:1.2em"></div>
+      <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid #333">
+        <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+          <span style="font-size:0.85rem;color:#888">😴 Sleep in</span>
+          <select id="sleep-mins" style="background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.3rem">
+            <option value="15">15 min</option>
+            <option value="30" selected>30 min</option>
+            <option value="45">45 min</option>
+            <option value="60">60 min</option>
+            <option value="90">90 min</option>
+          </select>
+          <button onclick="setSleepTimer()" style="padding:0.3rem 0.7rem;background:#222;border:1px solid #444;border-radius:4px;color:#ccc;cursor:pointer">Set</button>
+          <button onclick="cancelSleepTimer()" style="padding:0.3rem 0.7rem;background:#222;border:1px solid #444;border-radius:4px;color:#ccc;cursor:pointer">Cancel</button>
+          <span id="sleep-status" style="font-size:0.8rem;color:#888"></span>
+        </div>
+      </div>
     </div>
   </details>
 
@@ -1534,6 +1581,7 @@ async function loadDisplayState() {
       b.disabled = true; b.style.opacity = '0.4'; b.style.cursor = 'not-allowed';
     });
   }
+  updateSleepStatus();
 }
 
 async function setDisplayMode(mode) {
@@ -1555,6 +1603,30 @@ async function applyDisplayOptions() {
   const body = {mode: _dispMode, overlay_enabled: document.getElementById('disp-overlay').checked,
                 visualizer_mirror: document.getElementById('disp-mirror').checked};
   await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+}
+
+async function setSleepTimer() {
+  const mins = document.getElementById('sleep-mins').value;
+  await fetch('/sleep-timer', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({minutes: parseInt(mins)})});
+  updateSleepStatus();
+}
+async function cancelSleepTimer() {
+  await fetch('/sleep-timer', {method:'DELETE'});
+  document.getElementById('sleep-status').textContent = '';
+}
+async function updateSleepStatus() {
+  try {
+    const s = await fetch('/sleep-timer').then(r => r.json());
+    const el = document.getElementById('sleep-status');
+    if (s.active) {
+      const m = Math.floor(s.remaining_seconds / 60);
+      const sec = s.remaining_seconds % 60;
+      el.textContent = `⏱ ${m}:${String(sec).padStart(2,'0')} remaining`;
+    } else {
+      el.textContent = '';
+    }
+  } catch(e) {}
 }
 
 document.getElementById('display-panel').addEventListener('toggle', e => {
@@ -2216,6 +2288,17 @@ REMOTE_HTML = """\
     <button class="btn-skip" onclick="playerCmd('next')" title="Next">⏭</button>
   </div>
 
+  <div style="margin-top:1rem">
+    <input type="range" id="seekBar" min="0" max="100" value="0"
+      style="width:100%;accent-color:#4af"
+      oninput="_seekDragging=true"
+      onchange="seekTo(this.value)">
+    <div style="display:flex;justify-content:space-between;font-size:0.75rem;color:#888;margin-top:0.25rem">
+      <span id="seekPos">0:00</span>
+      <span id="seekDur">0:00</span>
+    </div>
+  </div>
+
   <hr class="divider">
 
   <div class="vol-section">
@@ -2288,6 +2371,18 @@ function toggleMute() {
 }
 
 // ── Player ──
+let _seekDragging = false;
+function fmtTime(s) {
+  const m = Math.floor(s/60);
+  return m+':'+String(Math.floor(s%60)).padStart(2,'0');
+}
+async function seekTo(val) {
+  _seekDragging = false;
+  const pos = parseFloat(val);
+  await fetch('/player', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action:'seek', position: pos})});
+}
+
 function playerCmd(action) {
   fetch('/player', {
     method: 'POST',
@@ -2303,6 +2398,13 @@ function pollPlayer() {
     document.getElementById('track-album').textContent = d.album || '';
     document.getElementById('track-status').textContent = d.status || 'Stopped';
     playBtn.textContent = d.status === 'Playing' ? '⏸' : '▶';
+    if (!_seekDragging && d.duration > 0) {
+      const bar = document.getElementById('seekBar');
+      bar.max = d.duration;
+      bar.value = d.position;
+      document.getElementById('seekPos').textContent = fmtTime(d.position);
+      document.getElementById('seekDur').textContent = fmtTime(d.duration);
+    }
   });
 }
 
@@ -2571,6 +2673,10 @@ _apply_lock = threading.Lock()
 _apply_status = {"state": "idle", "error": None}   # "idle" | "applying" | "done" | "error"
 _apply_status_lock = threading.Lock()
 
+_sleep_timer: threading.Timer = None
+_sleep_timer_end: float = 0.0
+_sleep_timer_lock = threading.Lock()
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -2644,6 +2750,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {"mode": "off", "overlay_enabled": True,
                                      "visualizer_mirror": False,
                                      "status": "daemon_down", "track": None})
+        elif self.path == "/sleep-timer":
+            with _sleep_timer_lock:
+                remaining = max(0.0, _sleep_timer_end - time.time()) if _sleep_timer else 0.0
+            self.send_json(200, {"active": _sleep_timer is not None, "remaining_seconds": int(remaining)})
         else:
             body = HTML.encode()
             self.send_response(200)
@@ -2653,7 +2763,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_POST(self):
-        if self.path not in ("/apply", "/balance", "/mode", "/volume", "/player", "/debug-volume", "/debug-test", "/source", "/network-config", "/buffers", "/restart-service", "/play-sync-test", "/calib-stream", "/presets", "/presets/load", "/presets/delete", "/hdmi", "/power", "/display"):
+        if self.path not in ("/apply", "/balance", "/mode", "/volume", "/player", "/debug-volume", "/debug-test", "/source", "/network-config", "/buffers", "/restart-service", "/play-sync-test", "/calib-stream", "/presets", "/presets/load", "/presets/delete", "/hdmi", "/power", "/display", "/sleep-timer"):
             self.send_json(404, {"ok": False, "msg": "not found"})
             return
 
@@ -2966,6 +3076,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/player":
             action = data.get("action", "")
+            if action == "seek":
+                pos = float(data.get("position", 0))
+                subprocess.run(["playerctl", "position", str(pos)], stderr=subprocess.DEVNULL)
+                self.send_json(200, {"ok": True, "msg": "seeked"})
+                return
             if action not in ("play-pause", "next", "previous", "play", "pause"):
                 self.send_json(400, {"ok": False, "msg": "invalid action"})
                 return
@@ -2974,6 +3089,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "msg": action})
             except subprocess.CalledProcessError:
                 self.send_json(200, {"ok": True, "msg": "no player"})
+            return
+
+        if self.path == "/sleep-timer":
+            minutes = float(data.get("minutes", 30))
+            seconds = minutes * 60
+            with _sleep_timer_lock:
+                global _sleep_timer, _sleep_timer_end
+                if _sleep_timer:
+                    _sleep_timer.cancel()
+                _sleep_timer = threading.Timer(seconds, _sleep_timer_fire)
+                _sleep_timer.daemon = True
+                _sleep_timer.start()
+                _sleep_timer_end = time.time() + seconds
+            self.send_json(200, {"ok": True, "minutes": minutes})
             return
 
         if self.path == "/debug-volume":
@@ -3067,6 +3196,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg   = f"{label} +{delay_ms}ms Delay angewendet."
 
         self.send_json(200, {"ok": True, "msg": msg})
+
+    def do_DELETE(self):
+        if self.path == "/sleep-timer":
+            with _sleep_timer_lock:
+                global _sleep_timer, _sleep_timer_end
+                if _sleep_timer:
+                    _sleep_timer.cancel()
+                    _sleep_timer = None
+                    _sleep_timer_end = 0.0
+            self.send_json(200, {"ok": True})
+        else:
+            self.send_json(404, {"error": "not found"})
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
