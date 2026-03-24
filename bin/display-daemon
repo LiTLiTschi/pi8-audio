@@ -326,11 +326,22 @@ def fb_clear(fb_mm, w, h, bpp_bytes):
 
 # ── mpv IPC helpers ───────────────────────────────────────────────────────────
 def _mpv_send(cmd: list):
+    """Send one command to mpv IPC; return the first JSON response line."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
+        s.settimeout(2.0)
         s.connect(MPV_SOCK)
         s.sendall(json.dumps({"command": cmd}).encode() + b"\n")
-        return json.loads(s.recv(4096))
+        # mpv may send multiple newline-delimited JSON objects (response + events).
+        # Only parse the first complete line — the command response.
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n")[0].strip()
+        return json.loads(line) if line else {}
     finally:
         s.close()
 
@@ -535,11 +546,13 @@ def render_clock_frame(W: int, H: int) -> "Image.Image":
 def crossfade_to(old_frame, new_frame, W, H):
     os.makedirs(CF_DIR, exist_ok=True)
     old = old_frame if old_frame is not None else Image.new("RGB", (W, H), (0,0,0))
+    # Use JPEG (not PNG) for intermediate frames — encoding is ~10x faster on Pi4.
+    # 10 frames is visually smooth and halves the blend work vs. 20.
     paths = []
-    for i in range(20):
-        blend = Image.blend(old, new_frame, (i + 1) / 20)
-        p = f"{CF_DIR}/frame-{i:02d}.png"
-        blend.save(p)
+    for i in range(10):
+        blend = Image.blend(old, new_frame, (i + 1) / 10)
+        p = f"{CF_DIR}/frame-{i:02d}.jpg"
+        blend.save(p, "JPEG", quality=85, optimize=False)
         paths.append(p)
     try:
         for p in paths:
@@ -673,6 +686,7 @@ def display_controller():
     lyrics_stop  = threading.Event()
     current_mode = "off"
     old_frame    = [None]
+    base_frame   = [None]  # full render without lyrics — reused by lyrics updater
     skip_count   = [0]
     lyrics_thread = [None]
     clock_timer  = [None]
@@ -801,13 +815,26 @@ def display_controller():
             except Exception:
                 continue
             cur, nxt = get_lyrics_lines(pos)
+            if base_frame[0] is None:
+                continue
             try:
-                with _lock:
-                    title  = _track["title"]
-                    artist = _track["artist"]
-                    artUrl = _track["artUrl"]
-                frame = render_now_playing(title, artist, artUrl, overlay, W, H,
-                                           lyrics_line=cur, lyrics_next=nxt)
+                # Fast path: composite lyrics text onto cached base frame
+                # Avoids re-running the expensive 4K blur/resize every 1.5s
+                frame = base_frame[0].copy()
+                if cur:
+                    draw = ImageDraw.Draw(frame)
+                    scale = H / 1080
+                    try:
+                        fl  = ImageFont.truetype(FONT_REG, int(32 * scale))
+                        fln = ImageFont.truetype(FONT_REG, int(28 * scale))
+                    except Exception:
+                        fl = fln = ImageFont.load_default()
+                    ly  = int(H * 0.91)
+                    ly2 = int(H * 0.96)
+                    for dx, dy, col in [(1, 1, (0, 0, 0)), (0, 0, (255, 255, 255))]:
+                        draw.text((W//2+dx, ly+dy), cur, font=fl, fill=col, anchor="mm")
+                    if nxt:
+                        draw.text((W//2, ly2), nxt, font=fln, fill=(180, 180, 180), anchor="mm")
                 frame.save(NP_FILE)
                 mpv_loadfile(NP_FILE, loop=True)
             except Exception as e:
@@ -876,6 +903,7 @@ def display_controller():
             log.info("render: %r — %r (artUrl=%s)", ev.title, ev.artist, "yes" if ev.artUrl else "no")
             new_frame = render_now_playing(ev.title, ev.artist, ev.artUrl, overlay, W, H,
                                            album=getattr(ev, "album", ""))
+            base_frame[0] = new_frame  # cache without lyrics for cheap updater compositing
             crossfade_to(old_frame[0], new_frame, W, H)
             old_frame[0] = new_frame
             with _lock:
@@ -975,12 +1003,15 @@ def display_controller():
 
         if isinstance(ev, ModeChangeEvent):
             new_mode = ev.mode
-            if new_mode != current_mode:
+            mode_changed = new_mode != current_mode
+            if mode_changed:
                 teardown(current_mode)
                 ok = setup(new_mode)
                 current_mode = new_mode if ok else "off"
-            # always re-render now-playing with current track after any mode event
-            if current_mode == "now-playing":
+            # Re-render now-playing only when mode actually changed OR when the track
+            # has not been rendered yet (base_frame is None). Skipping the re-render
+            # when mode is unchanged avoids a redundant ~15s crossfade on Pi4.
+            if current_mode == "now-playing" and (mode_changed or base_frame[0] is None):
                 with _lock:
                     t = MetadataEvent(_track["title"], _track["artist"], _track["artUrl"])
                 do_render(t)
