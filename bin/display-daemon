@@ -47,6 +47,7 @@ def load_display_config():
 _display_config = load_display_config()
 COVER_FILE = "/tmp/display-cover.jpg"
 NP_FILE    = "/tmp/now-playing.png"
+NP_FILE_TMP = "/tmp/now-playing-tmp.png"
 CF_DIR     = "/tmp/cf"
 MPV_SOCK   = "/tmp/mpv-display.sock"
 CAVA_CONF  = "/tmp/cava-display.conf"
@@ -98,6 +99,12 @@ def save_state(s):
         tmp.rename(STATE_FILE)
     except Exception:
         pass
+
+
+def save_np_frame(img: "Image.Image"):
+    """Atomically write a PIL image to NP_FILE to prevent partial-read races."""
+    img.save(NP_FILE_TMP)
+    os.rename(NP_FILE_TMP, NP_FILE)
 
 
 def append_history(title: str, artist: str, album: str = ""):
@@ -558,7 +565,7 @@ def crossfade_to(old_frame, new_frame, W, H):
         for p in paths:
             mpv_loadfile(p)
             time.sleep(1 / 30)
-        new_frame.save(NP_FILE)
+        save_np_frame(new_frame)
         mpv_loadfile(NP_FILE, loop=True)
     finally:
         for p in paths:
@@ -705,7 +712,7 @@ def display_controller():
             mpv_proc[0].terminate()
             try: mpv_proc[0].wait(timeout=3)
             except subprocess.TimeoutExpired: mpv_proc[0].kill()
-        Image.new("RGB", (W, H), (0,0,0)).save(NP_FILE)
+        save_np_frame(Image.new("RGB", (W, H), (0,0,0)))
         mpv_proc[0] = subprocess.Popen(
             ["mpv", "--vo=drm", f"--drm-connector={mpv_connector}", "--fullscreen",
              f"--input-ipc-server={MPV_SOCK}",
@@ -835,7 +842,7 @@ def display_controller():
                         draw.text((W//2+dx, ly+dy), cur, font=fl, fill=col, anchor="mm")
                     if nxt:
                         draw.text((W//2, ly2), nxt, font=fln, fill=(180, 180, 180), anchor="mm")
-                frame.save(NP_FILE)
+                save_np_frame(frame)
                 mpv_loadfile(NP_FILE, loop=True)
             except Exception as e:
                 log.debug("lyrics updater render error: %s", e)
@@ -865,7 +872,7 @@ def display_controller():
         elif mode == "now-playing":
             chvt(2); launch_mpv()
             black = Image.new("RGB", (W, H), (0,0,0))
-            black.save(NP_FILE); mpv_loadfile(NP_FILE, loop=True)
+            save_np_frame(black); mpv_loadfile(NP_FILE, loop=True)
             old_frame[0] = black
             with _lock: _g["status"] = "idle"
             # Start lyrics updater thread
@@ -926,7 +933,7 @@ def display_controller():
         try:
             fallback = render_now_playing(ev.title, ev.artist, ev.artUrl, overlay, W, H,
                                           album=getattr(ev, "album", ""))
-            fallback.save(NP_FILE)
+            save_np_frame(fallback)
             mpv_loadfile(NP_FILE)
         except Exception as e:
             log.debug("fallback cover render failed: %s", e)
@@ -1025,7 +1032,7 @@ def display_controller():
                     def _show_clock():
                         try:
                             frame = render_clock_frame(W, H)
-                            frame.save(NP_FILE)
+                            save_np_frame(frame)
                             mpv_loadfile(NP_FILE, loop=True)
                         except Exception as e:
                             log.debug("clock render failed: %s", e)
@@ -1041,7 +1048,7 @@ def display_controller():
                 with _lock: _g["status"] = "idle"
                 if current_mode == "now-playing":
                     black = Image.new("RGB", (W, H), (0,0,0))
-                    black.save(NP_FILE); mpv_loadfile(NP_FILE, loop=True)
+                    save_np_frame(black); mpv_loadfile(NP_FILE, loop=True)
                     old_frame[0] = black
             elif ev.status not in ("Paused",):
                 with _lock:
