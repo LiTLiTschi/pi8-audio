@@ -1268,6 +1268,8 @@ HTML = """\
       </div>
       <div id="disp-overlay-row" style="display:none;margin-bottom:0.5rem">
         <label style="font-size:0.9rem;color:#ccc"><input type="checkbox" id="disp-overlay" onchange="applyDisplayOptions()"> Show title / artist overlay</label>
+        &nbsp;&nbsp;
+        <label style="font-size:0.9rem;color:#ccc"><input type="checkbox" id="disp-lyrics" onchange="applyDisplayOptions()"> Lyrics</label>
       </div>
       <div id="disp-mirror-row" style="display:none;margin-bottom:0.5rem">
         <label style="font-size:0.9rem;color:#ccc"><input type="checkbox" id="disp-mirror" onchange="applyDisplayOptions()"> Mirror bars</label>
@@ -1640,6 +1642,7 @@ async function loadDisplayState() {
     document.getElementById('theme-' + (s.visualizer_theme || 'default'))?.classList.add('active');
     document.getElementById('disp-overlay').checked = !!s.overlay_enabled;
     document.getElementById('disp-mirror').checked  = !!s.visualizer_mirror;
+    document.getElementById('disp-lyrics').checked  = s.lyrics_enabled !== false;
     const t = s.track;
     const statusEl = document.getElementById('disp-status');
     if (s.status === 'playing' && t && (t.title || t.artist)) {
@@ -1665,7 +1668,8 @@ async function setDisplayMode(mode) {
 
   const s = { mode,
     overlay_enabled: document.getElementById('disp-overlay').checked,
-    visualizer_mirror: document.getElementById('disp-mirror').checked };
+    visualizer_mirror: document.getElementById('disp-mirror').checked,
+    lyrics_enabled: document.getElementById('disp-lyrics').checked };
   await fetch('/display', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(s)});
   loadDisplayState();
@@ -1673,7 +1677,8 @@ async function setDisplayMode(mode) {
 
 async function applyDisplayOptions() {
   const body = {mode: _dispMode, overlay_enabled: document.getElementById('disp-overlay').checked,
-                visualizer_mirror: document.getElementById('disp-mirror').checked};
+                visualizer_mirror: document.getElementById('disp-mirror').checked,
+                lyrics_enabled: document.getElementById('disp-lyrics').checked};
   await fetch('/display', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 }
 

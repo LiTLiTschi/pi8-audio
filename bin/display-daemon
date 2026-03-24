@@ -56,7 +56,7 @@ PORT       = 8084
 
 # ── Shared mutable state (all protected by _lock) ────────────────────────────
 _lock   = threading.Lock()
-_state  = {"mode": "off", "overlay_enabled": True, "visualizer_mirror": False, "visualizer_theme": "default"}
+_state  = {"mode": "off", "overlay_enabled": True, "visualizer_mirror": False, "visualizer_theme": "default", "lyrics_enabled": True}
 _track  = {"title": "", "artist": "", "artUrl": ""}
 _g      = {"status": "idle"}   # volatile string; use dict to avoid global rebind issues
 _queue  : queue.Queue = queue.Queue()
@@ -200,6 +200,61 @@ def _itunes_cover(artist: str, title: str) -> str:
     except Exception as e:
         log.debug("iTunes lookup failed: %s", e)
     return ""
+
+
+# ── LRCLIB lyrics ─────────────────────────────────────────────────────────────
+import re as _re
+_lyrics_lock = threading.Lock()
+_lyrics_data = {"synced": [], "plain": [], "artist": "", "title": ""}
+# synced: list of (seconds_float, line_text) sorted by time
+# plain:  list of line_text strings
+
+def _parse_synced(text: str) -> list:
+    """Parse [MM:SS.cs] lines → [(secs, text), ...]"""
+    result = []
+    for line in text.splitlines():
+        m = _re.match(r'\[(\d+):(\d+\.\d+)\](.*)', line)
+        if m:
+            secs = int(m.group(1)) * 60 + float(m.group(2))
+            result.append((secs, m.group(3).strip()))
+    return sorted(result, key=lambda x: x[0])
+
+def fetch_lyrics(artist: str, title: str):
+    """Fetch and store lyrics from LRCLIB in background."""
+    if not artist and not title:
+        with _lyrics_lock:
+            _lyrics_data.update(synced=[], plain=[], artist="", title="")
+        return
+    try:
+        q = urllib.parse.urlencode({"artist_name": artist, "track_name": title})
+        req = urllib.request.Request(
+            f"https://lrclib.net/api/get?{q}",
+            headers={"User-Agent": "display-daemon/2.0 (pi8-audio)"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        synced = _parse_synced(data.get("syncedLyrics") or "")
+        plain = [l for l in (data.get("plainLyrics") or "").splitlines() if l.strip()]
+        with _lyrics_lock:
+            _lyrics_data.update(synced=synced, plain=plain, artist=artist, title=title)
+        log.info("lyrics fetched for %r — %r (%d synced lines)", artist, title, len(synced))
+    except Exception as e:
+        log.debug("lyrics fetch failed for %r — %r: %s", artist, title, e)
+        with _lyrics_lock:
+            _lyrics_data.update(synced=[], plain=[], artist=artist, title=title)
+
+def get_lyrics_lines(position_secs: float) -> tuple:
+    """Return (current_line, next_line) for the given position."""
+    with _lyrics_lock:
+        synced = list(_lyrics_data["synced"])
+    if synced:
+        idx = 0
+        for i, (t, _) in enumerate(synced):
+            if t <= position_secs:
+                idx = i
+        cur = synced[idx][1] if synced else ""
+        nxt = synced[idx + 1][1] if idx + 1 < len(synced) else ""
+        return cur[:60], nxt[:60]
+    return "", ""
 
 
 def gradient_from_artist(artist: str, W: int, H: int) -> "Image.Image":
@@ -368,7 +423,8 @@ def _dominant_colour(img: "Image.Image") -> tuple:
         return (255, 255, 255)
 
 
-def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album=""):
+def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album="",
+                       lyrics_line="", lyrics_next=""):
     # Resolve cover art: MPRIS artUrl → online lookup → None
     resolved_url = artUrl
     if not resolved_url and (artist or title):
@@ -429,6 +485,24 @@ def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album=""):
                       fill=col if col != (0,0,0) else (0,0,0), anchor="mm")
         draw.text((cx, ay_t), (artist or "").upper(), font=fa,
                   fill=(204,204,204), anchor="mm")
+
+    if overlay_enabled and lyrics_line:
+        scale = H / 1080
+        try:
+            fl  = ImageFont.truetype(FONT_REG, int(32 * scale))
+            fln = ImageFont.truetype(FONT_REG, int(28 * scale))
+        except Exception:
+            fl = fln = ImageFont.load_default()
+        draw = ImageDraw.Draw(frame)
+        ly  = int(H * 0.91)
+        ly2 = int(H * 0.96)
+        # Current line with shadow
+        for dx, dy, col in [(1, 1, (0, 0, 0)), (0, 0, (255, 255, 255))]:
+            draw.text((W // 2 + dx, ly + dy), lyrics_line, font=fl,
+                      fill=col, anchor="mm")
+        if lyrics_next:
+            draw.text((W // 2, ly2), lyrics_next, font=fln,
+                      fill=(180, 180, 180), anchor="mm")
 
     return frame
 
@@ -589,9 +663,11 @@ def display_controller():
     fb_W         = [W]
     fb_H         = [H]
     vis_stop     = threading.Event()
+    lyrics_stop  = threading.Event()
     current_mode = "off"
     old_frame    = [None]
     skip_count   = [0]
+    lyrics_thread = [None]
 
     # ── chvt ──────────────────────────────────────────────────────────────────
     def chvt(n):
@@ -694,6 +770,41 @@ def display_controller():
             except Exception: pass
             cava_proc[0] = None
 
+    # ── lyrics updater thread ──────────────────────────────────────────────────
+    def _lyrics_updater():
+        """Continuously update lyrics display while in now-playing mode."""
+        while not lyrics_stop.is_set():
+            lyrics_stop.wait(timeout=1.5)
+            if lyrics_stop.is_set():
+                break
+            with _lock:
+                mode    = _state.get("mode", "off")
+                enabled = _state.get("lyrics_enabled", True)
+                overlay = _state.get("overlay_enabled", True)
+            if mode != "now-playing" or not enabled or not overlay:
+                continue
+            # Skip if a crossfade render is in progress
+            if _rendering[0]:
+                continue
+            try:
+                r = subprocess.run(["playerctl", "position"],
+                                   capture_output=True, text=True, timeout=2)
+                pos = float(r.stdout.strip()) if r.returncode == 0 else 0.0
+            except Exception:
+                continue
+            cur, nxt = get_lyrics_lines(pos)
+            try:
+                with _lock:
+                    title  = _track["title"]
+                    artist = _track["artist"]
+                    artUrl = _track["artUrl"]
+                frame = render_now_playing(title, artist, artUrl, overlay, W, H,
+                                           lyrics_line=cur, lyrics_next=nxt)
+                frame.save(NP_FILE)
+                mpv_loadfile(NP_FILE, loop=True)
+            except Exception as e:
+                log.debug("lyrics updater render error: %s", e)
+
     # ── mode transitions ───────────────────────────────────────────────────────
     def teardown(mode):
         global _clock_timer
@@ -701,6 +812,11 @@ def display_controller():
             if _clock_timer:
                 _clock_timer.cancel()
                 _clock_timer = None
+            # Stop lyrics updater thread
+            lyrics_stop.set()
+            if lyrics_thread[0] and lyrics_thread[0].is_alive():
+                lyrics_thread[0].join(timeout=3)
+            lyrics_thread[0] = None
             kill_mpv(); chvt(1)
         elif mode == "visualizer":
             stop_cava(); close_fb(); chvt(1)
@@ -718,6 +834,10 @@ def display_controller():
             black.save(NP_FILE); mpv_loadfile(NP_FILE, loop=True)
             old_frame[0] = black
             with _lock: _g["status"] = "idle"
+            # Start lyrics updater thread
+            lyrics_stop.clear()
+            lyrics_thread[0] = threading.Thread(target=_lyrics_updater, daemon=True)
+            lyrics_thread[0].start()
         elif mode == "visualizer":
             chvt(2); open_fb()
             if not start_cava():
@@ -739,6 +859,12 @@ def display_controller():
         if _rendering[0]:
             return
         _rendering[0] = True
+        # Clear stale lyrics immediately so updater doesn't show wrong lines
+        with _lyrics_lock:
+            _lyrics_data.update(synced=[], plain=[])
+        # Fetch new lyrics in background
+        threading.Thread(target=fetch_lyrics,
+                         args=(ev.artist, ev.title), daemon=True).start()
         try:
             overlay = _state.get("overlay_enabled", True)
             log.info("render: %r — %r (artUrl=%s)", ev.title, ev.artist, "yes" if ev.artUrl else "no")
@@ -947,6 +1073,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if k in body: _state[k] = body[k]
             if "visualizer_theme" in body and body["visualizer_theme"] in _VIS_THEMES:
                 _state["visualizer_theme"] = body["visualizer_theme"]
+            if "lyrics_enabled" in body:
+                _state["lyrics_enabled"] = bool(body["lyrics_enabled"])
             ev = ModeChangeEvent(_state["mode"], _state["overlay_enabled"],
                                  _state["visualizer_mirror"])
             state_snapshot = dict(_state)
@@ -995,7 +1123,7 @@ if __name__ == "__main__":
     os.makedirs(CF_DIR, exist_ok=True)
     saved = load_state()
     with _lock:
-        for k in ("mode", "overlay_enabled", "visualizer_mirror"):
+        for k in ("mode", "overlay_enabled", "visualizer_mirror", "lyrics_enabled"):
             if k in saved: _state[k] = saved[k]
 
     try: os.unlink(MPV_SOCK)
