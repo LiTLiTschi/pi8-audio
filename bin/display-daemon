@@ -317,6 +317,29 @@ def mpv_wait_end_file():
 _cover_cache  = [None]
 _last_art_url = [""]
 
+
+def _dominant_colour(img: "Image.Image") -> tuple:
+    """Extract brightest accent colour from image for text overlay."""
+    try:
+        small = img.resize((50, 50), Image.LANCZOS).convert("HSV" if hasattr(Image, "HSV") else "RGB")
+        # Use RGB path: average the most saturated pixels
+        arr = list(img.resize((50, 50)).convert("RGB").getdata())
+        # Find pixel with highest saturation
+        best = (255, 255, 255)
+        best_sat = 0
+        import colorsys
+        for r, g, b in arr:
+            h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
+            if s > best_sat and v > 0.3:
+                best_sat = s
+                # Return brightened version: same hue, high saturation + value
+                pr, pg, pb = colorsys.hsv_to_rgb(h, min(s * 1.5, 1.0), 0.95)
+                best = (int(pr*255), int(pg*255), int(pb*255))
+        return best
+    except Exception:
+        return (255, 255, 255)
+
+
 def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album=""):
     # Resolve cover art: MPRIS artUrl → online lookup → None
     resolved_url = artUrl
@@ -336,6 +359,7 @@ def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album=""):
             _art_cache.pop(key, None)
 
     cover = _cover_cache[0]
+    accent = _dominant_colour(_cover_cache[0]) if _cover_cache[0] else (255, 255, 255)
     frame = (gradient_from_artist(artist, W, H)
              if (not _cover_cache[0] and (artist or title))
              else Image.new("RGB", (W, H), (0, 0, 0)))
@@ -372,8 +396,9 @@ def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album=""):
         ty = int(H * 0.78)
         ay_t = int(H * 0.85)
         sd = max(2, int(2 * scale))
-        for dx, dy, col in [(sd, sd, (0,0,0)), (0, 0, (255,255,255))]:
-            draw.text((cx+dx, ty+dy), title or "", font=ft, fill=col, anchor="mm")
+        for dx, dy, col in [(sd, sd, (0,0,0)), (0, 0, accent)]:
+            draw.text((cx+dx, ty+dy), title or "", font=ft,
+                      fill=col if col != (0,0,0) else (0,0,0), anchor="mm")
         draw.text((cx, ay_t), (artist or "").upper(), font=fa,
                   fill=(204,204,204), anchor="mm")
 
@@ -666,6 +691,17 @@ def display_controller():
         with _lock:
             _track.update(title=ev.title, artist=ev.artist)
             _g["status"] = "searching"
+
+        # Show cover art while searching
+        with _lock:
+            overlay = _state.get("overlay_enabled", True)
+        try:
+            fallback = render_now_playing(ev.title, ev.artist, ev.artUrl, overlay, W, H,
+                                          album=getattr(ev, "album", ""))
+            fallback.save(NP_FILE)
+            mpv_loadfile(NP_FILE)
+        except Exception as e:
+            log.debug("fallback cover render failed: %s", e)
 
         url = find_video_url(ev.artist, ev.title)
 
