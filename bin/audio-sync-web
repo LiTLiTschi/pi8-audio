@@ -1330,19 +1330,41 @@ async function applyDelay(target, delay_ms) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ target, delay_ms: parseFloat(delay_ms) })
     });
-    const data = await res.json();
-    if (data.ok) {
-      status.className = 'ok';
-      status.textContent = data.msg;
+    if (res.status === 202) {
+      const pollApply = setInterval(async () => {
+        try {
+          const s = await fetch('/apply-status').then(r => r.json());
+          if (s.state === 'done' || s.state === 'error') {
+            clearInterval(pollApply);
+            applyBtn.disabled = false;
+            if (s.state === 'error') {
+              status.className = 'err';
+              status.textContent = 'Fehler: ' + (s.error || 'unbekannt');
+            } else {
+              status.className = 'ok';
+              status.textContent = target
+                ? (parseFloat(delay_ms) === 0 ? 'Kein Delay — auto latency-compensate aktiv.' : (target === 'front' ? '3.5mm Front' : 'USB Rear') + ' +' + parseFloat(delay_ms) + 'ms Delay angewendet.')
+                : 'Kein Delay — auto latency-compensate aktiv.';
+            }
+          }
+        } catch(e) { /* ignore poll errors */ }
+      }, 500);
     } else {
-      status.className = 'err';
-      status.textContent = 'Fehler: ' + data.msg;
+      const data = await res.json();
+      if (data.ok) {
+        status.className = 'ok';
+        status.textContent = data.msg;
+      } else {
+        status.className = 'err';
+        status.textContent = 'Fehler: ' + (data.error || data.msg);
+      }
+      applyBtn.disabled = false;
     }
   } catch(e) {
     status.className = 'err';
     status.textContent = 'Netzwerkfehler: ' + e;
+    applyBtn.disabled = false;
   }
-  applyBtn.disabled = false;
 }
 
 applyBtn.addEventListener('click', () => {
@@ -1907,13 +1929,34 @@ document.getElementById('calib-sync-btn').addEventListener('click', async () => 
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ target: delay_ms > 0 ? target : null, delay_ms })
     });
-    const d = await res.json();
-    st.style.color = d.ok ? '#4c4' : '#f44';
-    st.textContent = d.ok ? `✓ ${delay_ms}ms auf ${target} angewendet!` : d.msg;
-    if (d.ok) {
-      slider.value = delay_ms; targetSel.value = target; updateDisplay();
-      calibPlayBtn.textContent = '▶ Stream starten';
-      calibPlayBtn.style.background = '#1a3a1a'; calibPlayBtn.style.color = '#8f8'; calibPlayBtn.style.borderColor = '#464';
+    if (res.status === 202) {
+      const pollApply = setInterval(async () => {
+        try {
+          const s = await fetch('/apply-status').then(r => r.json());
+          if (s.state === 'done' || s.state === 'error') {
+            clearInterval(pollApply);
+            if (s.state === 'error') {
+              st.style.color = '#f44';
+              st.textContent = 'Fehler: ' + (s.error || 'unbekannt');
+            } else {
+              st.style.color = '#4c4';
+              st.textContent = `✓ ${delay_ms}ms auf ${target} angewendet!`;
+              slider.value = delay_ms; targetSel.value = target; updateDisplay();
+              calibPlayBtn.textContent = '▶ Stream starten';
+              calibPlayBtn.style.background = '#1a3a1a'; calibPlayBtn.style.color = '#8f8'; calibPlayBtn.style.borderColor = '#464';
+            }
+          }
+        } catch(e) { /* ignore poll errors */ }
+      }, 500);
+    } else {
+      const d = await res.json();
+      st.style.color = d.ok ? '#4c4' : '#f44';
+      st.textContent = d.ok ? `✓ ${delay_ms}ms auf ${target} angewendet!` : (d.error || d.msg);
+      if (d.ok) {
+        slider.value = delay_ms; targetSel.value = target; updateDisplay();
+        calibPlayBtn.textContent = '▶ Stream starten';
+        calibPlayBtn.style.background = '#1a3a1a'; calibPlayBtn.style.color = '#8f8'; calibPlayBtn.style.borderColor = '#464';
+      }
     }
   } catch(e) { st.style.color = '#f44'; st.textContent = 'Fehler: ' + e; }
 });
@@ -2525,6 +2568,8 @@ function testSpeaker(ch) {
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 _apply_lock = threading.Lock()
+_apply_status = {"state": "idle", "error": None}   # "idle" | "applying" | "done" | "error"
+_apply_status_lock = threading.Lock()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -2588,6 +2633,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", len(body))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/apply-status":
+            with _apply_status_lock:
+                self.send_json(200, dict(_apply_status))
         elif self.path == "/display-state":
             try:
                 with urllib.request.urlopen("http://localhost:8084/state", timeout=2) as r:
@@ -2961,6 +3009,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "msg": f"Test {ch} done"})
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 self.send_json(200, {"ok": True, "msg": f"Test {ch} finished"})
+            return
+
+        if self.path == "/apply":
+            with _apply_status_lock:
+                if _apply_status["state"] == "applying":
+                    self.send_json(409, {"ok": False, "error": "already applying"})
+                    return
+                _apply_status["state"] = "applying"
+                _apply_status["error"] = None
+
+            def _do_apply():
+                try:
+                    with _apply_lock:
+                        state = load_state()
+                        state["target"]   = data.get("target")
+                        state["delay_ms"] = float(data.get("delay_ms", 0))
+                        save_state(state)
+                        apply_state(state)
+                    with _apply_status_lock:
+                        _apply_status["state"] = "done"
+                except Exception as e:
+                    print(f"apply_state failed: {e}")
+                    with _apply_status_lock:
+                        _apply_status["state"] = "error"
+                        _apply_status["error"] = str(e)
+
+            threading.Thread(target=_do_apply, daemon=True).start()
+            self.send_json(202, {"ok": True, "applying": True})
             return
 
         target   = data.get("target")   # "front" | "rear" | None
