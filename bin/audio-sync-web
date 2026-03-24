@@ -647,6 +647,19 @@ def delete_preset(name):
     state.get("presets", {}).pop(name, None)
     save_state(state)
 
+def save_preset_schedule(name, schedule):
+    """Update (or remove) the schedule field on an existing preset."""
+    state = load_state()
+    presets = state.setdefault("presets", {})
+    if name not in presets:
+        return False
+    if schedule:
+        presets[name]["schedule"] = schedule
+    else:
+        presets[name].pop("schedule", None)
+    save_state(state)
+    return True
+
 def load_preset(name):
     """Apply a preset: merge into current state and apply."""
     presets = get_presets()
@@ -655,6 +668,8 @@ def load_preset(name):
     preset = presets[name]
     state  = load_state()
     for k, v in preset.items():
+        if k == "schedule":
+            continue  # schedule is metadata, not an audio state key
         if v is not None:
             state[k] = v
     save_state(state)
@@ -668,6 +683,34 @@ def load_preset(name):
     if src in ("usb", "network"):
         set_source(src)
     return True, f"Preset '{name}' geladen."
+
+
+def _preset_scheduler():
+    import datetime
+    while True:
+        try:
+            now = datetime.datetime.now()
+            current_time = now.strftime("%H:%M")
+            current_day  = now.strftime("%a").lower()  # "mon", "tue", etc.
+            state = load_state()
+            for name, preset in state.get("presets", {}).items():
+                sched = preset.get("schedule")
+                if not sched:
+                    continue
+                if sched.get("time") != current_time:
+                    continue
+                days = [d.lower() for d in sched.get("days", [])]
+                if days and current_day not in days:
+                    continue
+                fire_key = f"{now.strftime('%Y-%m-%d')} {current_time}"
+                if _last_schedule_fire.get(name) == fire_key:
+                    continue  # already fired this minute
+                _last_schedule_fire[name] = fire_key
+                print(f"[scheduler] auto-applying preset: {name}")
+                load_preset(name)
+        except Exception as e:
+            print(f"[scheduler] error: {e}")
+        time.sleep(60)
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -993,6 +1036,8 @@ HTML = """\
     font-size: 0.8rem;
     color: #4c4;
   }
+  .day-btn{padding:0.2rem 0.35rem;background:#222;border:1px solid #444;border-radius:3px;color:#888;cursor:pointer;font-size:0.72rem;min-width:1.4rem}
+  .day-btn.active{background:#4af;color:#000;border-color:#4af}
 </style>
 </head>
 <body>
@@ -2111,6 +2156,7 @@ function renderPresets(presets) {
     list.innerHTML = '<div style="color:#555;font-size:0.8rem;text-align:center">Keine Presets gespeichert</div>';
     return;
   }
+  const allDays = ['mon','tue','wed','thu','fri','sat','sun'];
   names.forEach(name => {
     const p = presets[name];
     const info = [
@@ -2118,17 +2164,32 @@ function renderPresets(presets) {
       p.mode || '',
       p.target && p.delay_ms ? `${p.target}+${p.delay_ms}ms` : 'kein Delay',
     ].filter(Boolean).join(' · ');
+    const sched = p.schedule || {};
+    const schedHtml = `
+      <div style="margin-top:0.4rem;display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap">
+        <input type="time" value="${escHtml(sched.time||'')}"
+          style="background:#1a1a1a;color:#ccc;border:1px solid #444;border-radius:4px;padding:0.2rem 0.4rem;font-size:0.8rem"
+          onchange="setPresetScheduleTime(${JSON.stringify(name)}, this.value)">
+        <div style="display:flex;gap:0.2rem">
+          ${allDays.map(d => `<button class="day-btn${(sched.days||[]).includes(d) ? ' active' : ''}"
+            onclick="togglePresetDay(${JSON.stringify(name)}, '${d}', this)"
+            title="${d}">${d[0].toUpperCase()}</button>`).join('')}
+        </div>
+      </div>`;
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;gap:0.4rem;align-items:center;background:#1a1a1a;border-radius:6px;padding:0.5rem 0.6rem';
+    row.style.cssText = 'background:#1a1a1a;border-radius:6px;padding:0.5rem 0.6rem';
     row.innerHTML = `
-      <div style="flex:1;min-width:0;overflow:hidden">
-        <div style="font-weight:700;color:#ddd;font-size:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(name)}</div>
-        <div style="font-size:0.72rem;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(info)}</div>
+      <div style="display:flex;gap:0.4rem;align-items:center">
+        <div style="flex:1;min-width:0;overflow:hidden">
+          <div style="font-weight:700;color:#ddd;font-size:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(name)}</div>
+          <div style="font-size:0.72rem;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(info)}</div>
+        </div>
+        <button onclick="loadPreset(${JSON.stringify(name)})"
+          style="padding:0.35rem 0.7rem;background:#1a3a1a;color:#8f8;border:1px solid #464;border-radius:6px;font-size:0.85rem;cursor:pointer;white-space:nowrap;flex-shrink:0">▶ Laden</button>
+        <button onclick="deletePreset(${JSON.stringify(name)})"
+          style="padding:0.35rem 0.55rem;background:#2a1a1a;color:#f88;border:1px solid #644;border-radius:6px;font-size:0.85rem;cursor:pointer;flex-shrink:0">✕</button>
       </div>
-      <button onclick="loadPreset(${JSON.stringify(name)})"
-        style="padding:0.35rem 0.7rem;background:#1a3a1a;color:#8f8;border:1px solid #464;border-radius:6px;font-size:0.85rem;cursor:pointer;white-space:nowrap;flex-shrink:0">▶ Laden</button>
-      <button onclick="deletePreset(${JSON.stringify(name)})"
-        style="padding:0.35rem 0.55rem;background:#2a1a1a;color:#f88;border:1px solid #644;border-radius:6px;font-size:0.85rem;cursor:pointer;flex-shrink:0">✕</button>
+      ${schedHtml}
     `;
     list.appendChild(row);
   });
@@ -2165,6 +2226,38 @@ document.getElementById('preset-save-btn').addEventListener('click', async () =>
 
 // Load presets on start
 fetch('/presets').then(r => r.json()).then(d => renderPresets(d.presets || {}));
+
+async function setPresetScheduleTime(name, timeVal) {
+  const state = await fetch('/state').then(r => r.json());
+  const preset = (state.presets || {})[name];
+  if (!preset) return;
+  let schedule = preset.schedule ? Object.assign({}, preset.schedule) : {};
+  if (timeVal) {
+    schedule.time = timeVal;
+    if (!schedule.days) schedule.days = ['mon','tue','wed','thu','fri','sat','sun'];
+  } else {
+    schedule = null;
+  }
+  const res = await fetch('/presets/schedule', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, schedule})});
+  const d = await res.json();
+  if (d.ok) renderPresets(d.presets);
+}
+
+async function togglePresetDay(name, day, btn) {
+  const state = await fetch('/state').then(r => r.json());
+  const preset = (state.presets || {})[name];
+  if (!preset) return;
+  const schedule = preset.schedule ? Object.assign({}, preset.schedule, {days: [...(preset.schedule.days || [])]}) : {days: []};
+  const days = schedule.days;
+  const idx = days.indexOf(day);
+  if (idx >= 0) days.splice(idx, 1); else days.push(day);
+  schedule.days = days;
+  const res = await fetch('/presets/schedule', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, schedule})});
+  const d = await res.json();
+  if (d.ok) btn.classList.toggle('active');
+}
 </script>
 </body>
 </html>
@@ -2731,6 +2824,8 @@ _sleep_timer: threading.Timer = None
 _sleep_timer_end: float = 0.0
 _sleep_timer_lock = threading.Lock()
 
+_last_schedule_fire: dict = {}  # preset_name → "YYYY-MM-DD HH:MM" of last fire
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -3037,6 +3132,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "msg": f"Preset '{name}' gelöscht.", "presets": get_presets()})
             return
 
+        if self.path == "/presets/schedule":
+            name     = data.get("name", "").strip()
+            schedule = data.get("schedule")  # dict or None/falsy to clear
+            if not name:
+                self.send_json(400, {"ok": False, "msg": "Name fehlt"})
+                return
+            ok = save_preset_schedule(name, schedule)
+            if ok:
+                self.send_json(200, {"ok": True, "presets": get_presets()})
+            else:
+                self.send_json(404, {"ok": False, "msg": "Preset nicht gefunden"})
+            return
+
         if self.path == "/hdmi":
             enabled    = bool(data.get("enabled", False))
             port       = int(data.get("port", 0))
@@ -3285,6 +3393,7 @@ if __name__ == "__main__":
             set_source(src)
     except Exception:
         pass
+    threading.Thread(target=_preset_scheduler, daemon=True).start()
     port = 8083
     server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"Audio Sync UI → http://pi8:{port}  (Ctrl+C zum Beenden)")
