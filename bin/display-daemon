@@ -91,7 +91,9 @@ def load_state():
 
 def save_state(s):
     try:
-        STATE_FILE.write_text(json.dumps(s, indent=2))
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(s, indent=2))
+        tmp.rename(STATE_FILE)
     except Exception:
         pass
 
@@ -420,6 +422,9 @@ def find_video_url(artist, title):
 
 # ── MPRIS watchers ────────────────────────────────────────────────────────────
 def mpris_metadata_watcher():
+    if not shutil.which("playerctl"):
+        log.warning("playerctl not found — metadata watcher disabled")
+        return
     debounce = [None]
     buf: dict = {}
 
@@ -451,12 +456,15 @@ def mpris_metadata_watcher():
                 debounce[0] = threading.Timer(0.2, flush)
                 debounce[0].start()
             proc.wait()
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("playerctl watcher error: %s", e)
         time.sleep(2)
 
 
 def mpris_status_watcher():
+    if not shutil.which("playerctl"):
+        log.warning("playerctl not found — status watcher disabled")
+        return
     while True:
         try:
             proc = subprocess.Popen(
@@ -465,8 +473,8 @@ def mpris_status_watcher():
             for line in proc.stdout:
                 _queue.put(StatusEvent(line.strip()))
             proc.wait()
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("playerctl watcher error: %s", e)
         time.sleep(2)
 
 
@@ -751,15 +759,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with _lock:
             for k in ("mode", "overlay_enabled", "visualizer_mirror"):
                 if k in body: _state[k] = body[k]
-            save_state(dict(_state))
             ev = ModeChangeEvent(_state["mode"], _state["overlay_enabled"],
                                  _state["visualizer_mirror"])
+            state_snapshot = dict(_state)
+        save_state(state_snapshot)
         _queue.put(ev)
         self.send_json(200, {"ok": True})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    shutil.rmtree(CF_DIR, ignore_errors=True)
     os.makedirs(CF_DIR, exist_ok=True)
     saved = load_state()
     with _lock:
