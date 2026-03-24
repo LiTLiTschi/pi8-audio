@@ -280,7 +280,11 @@ def _mpv_send(cmd: list):
     finally:
         s.close()
 
-def mpv_loadfile(path_or_url):
+def mpv_loadfile(path_or_url, loop=False):
+    try:
+        _mpv_send(["set_property", "loop-file", "inf" if loop else "no"])
+    except Exception:
+        pass
     _mpv_send(["loadfile", path_or_url, "replace"])
 
 def mpv_stop():
@@ -465,7 +469,7 @@ def crossfade_to(old_frame, new_frame, W, H):
         mpv_loadfile(p)
         time.sleep(1 / 30)
     new_frame.save(NP_FILE)
-    mpv_loadfile(NP_FILE)
+    mpv_loadfile(NP_FILE, loop=True)
     for p in paths:
         try: os.unlink(p)
         except Exception: pass
@@ -609,7 +613,6 @@ def display_controller():
              f"--input-ipc-server={MPV_SOCK}",
              "--no-terminal", "--idle=yes",
              "--ao=pipewire", "--audio-device=pipewire/combined",
-             "--loop-file=inf", "--image-display-duration=inf",
              NP_FILE],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if not mpv_wait_ready(5.0):
@@ -712,7 +715,7 @@ def display_controller():
         elif mode == "now-playing":
             chvt(2); launch_mpv()
             black = Image.new("RGB", (W, H), (0,0,0))
-            black.save(NP_FILE); mpv_loadfile(NP_FILE)
+            black.save(NP_FILE); mpv_loadfile(NP_FILE, loop=True)
             old_frame[0] = black
             with _lock: _g["status"] = "idle"
         elif mode == "visualizer":
@@ -861,7 +864,7 @@ def display_controller():
                         try:
                             frame = render_clock_frame(W, H)
                             frame.save(NP_FILE)
-                            mpv_loadfile(NP_FILE)
+                            mpv_loadfile(NP_FILE, loop=True)
                         except Exception as e:
                             log.debug("clock render failed: %s", e)
                     _clock_timer = threading.Timer(60.0, _show_clock)
@@ -876,7 +879,7 @@ def display_controller():
                 with _lock: _g["status"] = "idle"
                 if current_mode == "now-playing":
                     black = Image.new("RGB", (W, H), (0,0,0))
-                    black.save(NP_FILE); mpv_loadfile(NP_FILE)
+                    black.save(NP_FILE); mpv_loadfile(NP_FILE, loop=True)
                     old_frame[0] = black
             elif ev.status not in ("Paused",):
                 with _lock:
@@ -952,6 +955,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(200, {"ok": True})
 
 
+# ── BT connect watcher ────────────────────────────────────────────────────────
+def bt_connect_watcher():
+    """Auto-switch display when BT phone connects/disconnects."""
+    player_present = False
+    while True:
+        try:
+            r = subprocess.run(["playerctl", "status"],
+                               capture_output=True, text=True, timeout=3)
+            now_present = r.returncode == 0
+            if now_present != player_present:
+                player_present = now_present
+                with _lock:
+                    mode = _state.get("mode", "off")
+                if now_present and mode == "off":
+                    log.info("BT player connected — auto-switching to now-playing")
+                    with _lock:
+                        _state["mode"] = "now-playing"
+                    save_state(dict(_state))
+                    _queue.put(ModeChangeEvent("now-playing",
+                                               _state.get("overlay_enabled", True),
+                                               _state.get("visualizer_mirror", False)))
+                elif not now_present and mode == "now-playing":
+                    log.info("BT player disconnected — auto-switching to off")
+                    with _lock:
+                        _state["mode"] = "off"
+                    save_state(dict(_state))
+                    _queue.put(ModeChangeEvent("off",
+                                               _state.get("overlay_enabled", True),
+                                               _state.get("visualizer_mirror", False)))
+        except Exception as e:
+            log.debug("bt_connect_watcher error: %s", e)
+        time.sleep(5)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     shutil.rmtree(CF_DIR, ignore_errors=True)
@@ -964,7 +1001,8 @@ if __name__ == "__main__":
     try: os.unlink(MPV_SOCK)
     except FileNotFoundError: pass
 
-    for fn in (mpris_metadata_watcher, mpris_status_watcher, display_controller):
+    for fn in (mpris_metadata_watcher, mpris_status_watcher, display_controller,
+               bt_connect_watcher):
         threading.Thread(target=fn, daemon=True).start()
 
     # fire initial mode setup after controller thread starts
