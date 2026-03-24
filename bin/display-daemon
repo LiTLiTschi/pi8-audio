@@ -403,9 +403,9 @@ _last_art_url = [""]
 def _dominant_colour(img: "Image.Image") -> tuple:
     """Extract brightest accent colour from image for text overlay."""
     try:
-        small = img.resize((50, 50), Image.LANCZOS).convert("HSV" if hasattr(Image, "HSV") else "RGB")
-        # Use RGB path: average the most saturated pixels
-        arr = list(img.resize((50, 50)).convert("RGB").getdata())
+        # Use RGB path: find most saturated pixel
+        import numpy as np
+        arr = np.array(img.resize((50, 50), Image.LANCZOS).convert("RGB")).reshape(-1, 3).tolist()
         # Find pixel with highest saturation
         best = (255, 255, 255)
         best_sat = 0
