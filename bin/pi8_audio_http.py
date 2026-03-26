@@ -130,6 +130,11 @@ def get_state() -> dict[str, Any]:
     return _request("GET", "/state")
 
 
+def get_display_state() -> dict[str, Any]:
+    """GET /display-state — display-daemon / overlay snapshot from audio-sync-web."""
+    return _request("GET", "/display-state")
+
+
 def post_mode(mode: str) -> Any:
     return _request("POST", "/mode", {"mode": mode})
 

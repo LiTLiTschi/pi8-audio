@@ -25,8 +25,9 @@ echo "Deploying pi8-audioctl (CLI debug)..."
 cp "$REPO/bin/pi8-audioctl" ~/bin/pi8-audioctl
 chmod +x ~/bin/pi8-audioctl
 
-echo "Deploying pi8_presets + pi8-audio-tui..."
+echo "Deploying pi8_presets + pi8_audio_http + pi8-audio-tui..."
 cp "$REPO/bin/pi8_presets.py" ~/bin/pi8_presets.py
+cp "$REPO/bin/pi8_audio_http.py" ~/bin/pi8_audio_http.py
 cp "$REPO/bin/pi8-audio-tui" ~/bin/pi8-audio-tui
 chmod +x ~/bin/pi8-audio-tui
 

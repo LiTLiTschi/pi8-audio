@@ -69,6 +69,18 @@ class TestPi8AudioHttp(unittest.TestCase):
                 self.assertEqual(req.method, "GET")
                 self.assertIsNone(req.data)
 
+    def test_get_display_state(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                payload = {"mode": "now-playing", "overlay": "minimal", "ok": True}
+                m.return_value = _mock_http_response(json.dumps(payload).encode())
+                out = pi8_audio_http.get_display_state()
+                self.assertEqual(out, payload)
+                req = m.call_args[0][0]
+                self.assertEqual(req.get_full_url(), "http://127.0.0.1:8083/display-state")
+                self.assertEqual(req.method, "GET")
+                self.assertIsNone(req.data)
+
     def test_post_apply_delay_front(self):
         with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://example:8083"}):
             with patch("urllib.request.urlopen") as m:

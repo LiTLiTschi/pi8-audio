@@ -1,199 +1,325 @@
 #!/usr/bin/env python3
 """
-pi8-audio-tui — local curses UI for scene presets and audio_profile.
-Requires audio-sync-web on http://127.0.0.1:8083 for apply / profile toggle.
+pi8-audio-tui — multi-screen curses UI (stdlib only).
+Calls audio-sync-web via pi8_audio_http (PI8_AUDIO_SYNC_URL).
 """
 from __future__ import annotations
 
 import curses
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-import pi8_presets  # noqa: E402
+import pi8_audio_http  # noqa: E402
 
 BASE = os.environ.get("PI8_AUDIO_SYNC_URL", "http://127.0.0.1:8083")
 
+MENU_LABELS = [
+    "Dashboard",
+    "Audio",
+    "Display",
+    "Presets",
+    "System",
+    "Tools",
+    "Quit",
+]
 
-def _json_req(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
-    url = BASE.rstrip("/") + path
-    data = None
-    headers = {}
-    if method == "POST":
-        payload = body if body is not None else {}
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            raw = r.read().decode("utf-8")
-            return r.status, json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        try:
-            return e.code, json.loads(e.read().decode("utf-8"))
-        except Exception:
-            return e.code, {"msg": str(e)}
-    except OSError as e:
-        return -1, {"msg": str(e)}
+# view name (excluding menu) for placeholders
+PLACEHOLDER_VIEWS = frozenset({"audio", "display", "presets", "system", "tools"})
 
 
-def msgline(stdscr, y: int, s: str, attr: int = 0) -> None:
-    _, w = stdscr.getmaxyx()
-    stdscr.move(y, 0)
-    stdscr.clrtoeol()
+def _trunc(s: str, w: int) -> str:
+    if w <= 0:
+        return ""
     if len(s) >= w:
-        s = s[: w - 1]
-    stdscr.addstr(y, 0, s, attr)
+        return s[: w - 1]
+    return s
+
+
+def safe_addstr(stdscr, y: int, x: int, s: str, attr: int = 0) -> None:
+    my, mx = stdscr.getmaxyx()
+    if y < 0 or y >= my or x >= mx:
+        return
+    s = _trunc(s, mx - x)
+    try:
+        stdscr.addstr(y, x, s, attr)
+    except curses.error:
+        pass
+
+
+def collect_dashboard_lines(mx: int) -> tuple[list[str], list[str]]:
+    """Return (body lines, error lines)."""
+    errors: list[str] = []
+    lines: list[str] = []
+
+    try:
+        lines.append(_trunc(f"Hostname: {socket.gethostname()}", mx))
+    except OSError:
+        lines.append("(hostname unavailable)")
+
+    try:
+        state = pi8_audio_http.get_state()
+        lines.append("")
+        lines.append("--- GET /state ---")
+        pretty = json.dumps(state, indent=2, sort_keys=True)
+        for ln in pretty.splitlines()[:60]:
+            lines.append(_trunc(ln, mx))
+    except pi8_audio_http.Pi8AudioHttpError as e:
+        errors.append(_trunc(f"get_state: {e}", mx))
+    except OSError as e:
+        errors.append(_trunc(f"get_state: {e}", mx))
+
+    try:
+        dstate = pi8_audio_http.get_display_state()
+        lines.append("")
+        lines.append("--- display-state (key fields) ---")
+        if isinstance(dstate, dict):
+            preferred = (
+                "mode",
+                "overlay",
+                "mirror",
+                "theme",
+                "sleep_timer",
+                "sleep_remaining",
+                "ok",
+            )
+            shown = 0
+            for key in preferred:
+                if key in dstate:
+                    lines.append(_trunc(f"  {key}: {dstate[key]!r}", mx))
+                    shown += 1
+            if shown == 0:
+                for k, v in list(dstate.items())[:14]:
+                    lines.append(_trunc(f"  {k}: {v!r}", mx))
+        else:
+            lines.append(_trunc(f"  (unexpected): {dstate!r}", mx))
+    except pi8_audio_http.Pi8AudioHttpError as e:
+        errors.append(_trunc(f"get_display_state: {e}", mx))
+    except OSError as e:
+        errors.append(_trunc(f"get_display_state: {e}", mx))
+
+    wpctl = shutil.which("wpctl")
+    if wpctl:
+        try:
+            r = subprocess.run(
+                [wpctl, "status"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            lines.append("")
+            lines.append("--- wpctl status ---")
+            out = (r.stdout or r.stderr or "").splitlines()[:15]
+            for ln in out:
+                lines.append(_trunc(ln, mx))
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    jc = shutil.which("journalctl")
+    if jc:
+        try:
+            r = subprocess.run(
+                [
+                    "journalctl",
+                    "--user",
+                    "-u",
+                    "pipewire",
+                    "-n",
+                    "1",
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            lines.append("")
+            lines.append("--- pipewire (journalctl -n 1) ---")
+            blob = (r.stdout or r.stderr or "").strip()
+            log_lines = blob.splitlines() if blob else []
+            if log_lines:
+                lines.append(_trunc(log_lines[-1], mx))
+            else:
+                lines.append("(empty)")
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    return lines, errors
+
+
+def draw_menu(stdscr, sel: int) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "pi8-audio-tui", curses.A_BOLD)
+    safe_addstr(stdscr, 0, 16, _trunc(f" API {BASE}", mx - 16), curses.A_DIM)
+    safe_addstr(
+        stdscr,
+        1,
+        0,
+        _trunc("1-7 jump  ↑/↓  Enter  |  q quit", mx),
+        curses.A_DIM,
+    )
+    for i, label in enumerate(MENU_LABELS):
+        row = 3 + i
+        line = f" {i + 1}. {label}"
+        att = curses.A_REVERSE if i == sel else 0
+        safe_addstr(stdscr, row, 0, _trunc(line, mx), att)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Select screen", mx), curses.A_DIM)
+
+
+def draw_placeholder(stdscr, title: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, title, curses.A_BOLD)
+    safe_addstr(stdscr, 2, 0, "Coming in next tasks.", 0)
+    safe_addstr(stdscr, 4, 0, _trunc("Press q to return (or 0 to return).", mx), curses.A_DIM)
+    safe_addstr(stdscr, my - 1, 0, _trunc("q / 0 back", mx), curses.A_DIM)
+
+
+def merge_dashboard_body(errors: list[str], lines: list[str]) -> tuple[list[str], int]:
+    """Body lines and count of leading error lines (for bold); blank separator not counted."""
+    body: list[str] = []
+    n_err = len(errors)
+    body.extend(errors)
+    if errors:
+        body.append("")
+    body.extend(lines)
+    return body, n_err
+
+
+def draw_dashboard(
+    stdscr, body: list[str], err_line_count: int, scroll: int
+) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Dashboard", curses.A_BOLD)
+    safe_addstr(
+        stdscr,
+        1,
+        0,
+        _trunc("r refresh  ↑/↓ scroll  q menu", mx),
+        curses.A_DIM,
+    )
+    header_rows = 2
+    footer_rows = 1
+    avail = max(0, my - header_rows - footer_rows)
+    max_scroll = max(0, len(body) - avail)
+    s = min(max(0, scroll), max_scroll)
+    slice_body = body[s : s + avail]
+    for i, ln in enumerate(slice_body):
+        if 2 + i < my - footer_rows:
+            idx = s + i
+            att = curses.A_BOLD if idx < err_line_count else 0
+            safe_addstr(stdscr, 2 + i, 0, ln, att)
+    if len(body) > avail:
+        safe_addstr(
+            stdscr,
+            my - 1,
+            0,
+            _trunc(f"scroll {s}-{s + len(slice_body)}/{len(body)}", mx),
+            curses.A_DIM,
+        )
+    else:
+        safe_addstr(stdscr, my - 1, 0, _trunc("end", mx), curses.A_DIM)
+
+
+def apply_menu_selection(sel: int) -> str | None:
+    """Return next view name, or None to quit."""
+    if sel == 0:
+        return "dashboard"
+    if sel == 6:
+        return None
+    return ["audio", "display", "presets", "system", "tools"][sel - 1]
 
 
 def run(stdscr) -> None:
     curses.curs_set(0)
     stdscr.nodelay(False)
-    status = ""
-    row = 0
+    view = "menu"
+    menu_sel = 0
+    dash_body: list[str] = []
+    dash_err_n = 0
+    dash_scroll = 0
+
+    def refresh_dashboard() -> None:
+        nonlocal dash_body, dash_err_n, dash_scroll
+        mx = stdscr.getmaxyx()[1]
+        lines, errors = collect_dashboard_lines(mx)
+        dash_body, dash_err_n = merge_dashboard_body(errors, lines)
+        dash_scroll = 0
 
     while True:
-        stdscr.clear()
-        my, mx = stdscr.getmaxyx()
-        lines = min(my - 3, 20)
-        stdscr.addstr(0, 0, "pi8-audio-tui", curses.A_BOLD)
-        stdscr.addstr(0, 20, f"API {BASE}", curses.A_DIM)
-        stdscr.addstr(
-            1,
-            0,
-            "↑/↓ select  Enter apply  n new  d delete  [ / ] reorder  "
-            "a audio simple↔multi  r refresh  q quit",
-            curses.A_DIM,
-        )
-
-        store = pi8_presets.load_store()
-        verr = pi8_presets.validate_scene_store(store)
-        presets = store.get("presets", []) if isinstance(store.get("presets"), list) else []
-        if not isinstance(presets, list):
-            presets = []
-        if presets and row >= len(presets):
-            row = len(presets) - 1
-        if verr:
-            msgline(stdscr, my - 2, f"! store invalid: {verr}", curses.A_BOLD)
-        elif not presets:
-            msgline(stdscr, 3, "(no scenes — press n to add template, then edit file)", 0)
+        stdscr.timeout(-1)
+        if view == "menu":
+            draw_menu(stdscr, menu_sel)
+        elif view == "dashboard":
+            if not dash_body:
+                refresh_dashboard()
+            my, _ = stdscr.getmaxyx()
+            avail = max(0, my - 3)
+            max_scroll = max(0, len(dash_body) - avail)
+            dash_scroll = min(dash_scroll, max_scroll)
+            draw_dashboard(stdscr, dash_body, dash_err_n, dash_scroll)
+        elif view in PLACEHOLDER_VIEWS:
+            title = view.capitalize() if view != "presets" else "Presets"
+            draw_placeholder(stdscr, title)
         else:
-            for i in range(min(len(presets), lines)):
-                p = presets[i]
-                name = str(p.get("name", "?"))
-                label = str(p.get("label", name))
-                line = f" {name} — {label}"[: mx - 1]
-                att = curses.A_REVERSE if i == row else 0
-                stdscr.addstr(3 + i, 0, line, att)
-
-        if status:
-            msgline(stdscr, my - 2, status, curses.A_DIM)
+            return
 
         ch = stdscr.getch()
-        if ch in (ord("q"), ord("Q")):
-            return
-        if ch == ord("r"):
-            status = "refreshed"
+
+        if view == "menu":
+            if ch in (ord("q"), ord("Q")):
+                return
+            if ch == curses.KEY_UP and menu_sel > 0:
+                menu_sel -= 1
+            elif ch == curses.KEY_DOWN and menu_sel < len(MENU_LABELS) - 1:
+                menu_sel += 1
+            elif ord("1") <= ch <= ord("7"):
+                menu_sel = ch - ord("1")
+                dest = apply_menu_selection(menu_sel)
+                if dest is None:
+                    return
+                view = dest
+                if view == "dashboard":
+                    refresh_dashboard()
+            elif ch in (10, 13):
+                dest = apply_menu_selection(menu_sel)
+                if dest is None:
+                    return
+                view = dest
+                if view == "dashboard":
+                    refresh_dashboard()
             continue
-        if ch == ord("a"):
-            code, js = _json_req("GET", "/state")
-            if code != 200:
-                status = f"GET /state → {code} {js.get('msg', '')}"
+
+        if view == "dashboard":
+            if ch in (ord("q"), ord("Q")):
+                view = "menu"
                 continue
-            cur = js.get("audio_profile", "multi")
-            prof = "simple" if cur != "simple" else "multi"
-            code, js = _json_req("POST", "/audio-profile", {"profile": prof})
-            status = f"audio-profile → {prof} HTTP {code} {js.get('msg', '')}"
+            if ch == ord("r"):
+                refresh_dashboard()
+                continue
+            my = stdscr.getmaxyx()[0]
+            avail = max(0, my - 3)
+            total = len(dash_body)
+            max_scroll = max(0, total - avail)
+            if ch == curses.KEY_UP and dash_scroll > 0:
+                dash_scroll -= 1
+            elif ch == curses.KEY_DOWN and dash_scroll < max_scroll:
+                dash_scroll += 1
             continue
 
-        if verr or not presets:
-            if ch == ord("n"):
-                tmpl = pi8_presets.default_store()
-                tmpl["presets"] = [
-                    {
-                        "name": "example",
-                        "label": "Example",
-                        "display": {"mode": "now-playing"},
-                        "audio": {
-                            "profile": "simple",
-                            "hdmi_port": 0,
-                            "hdmi_enabled": True,
-                            "outputs_front_rear": False,
-                        },
-                    }
-                ]
-                try:
-                    pi8_presets.save_store(tmpl)
-                    status = "created ~/.config/pi8-presets.json template"
-                except ValueError as e:
-                    status = str(e)
-                except OSError as e:
-                    status = str(e)
+        if view in PLACEHOLDER_VIEWS:
+            if ch in (ord("q"), ord("Q"), ord("0")):
+                view = "menu"
             continue
-
-        if ch == curses.KEY_UP and row > 0:
-            row -= 1
-        elif ch == curses.KEY_DOWN and row < len(presets) - 1:
-            row += 1
-        elif ch == ord("n"):
-            # append template preset
-            tmpl = {
-                "name": f"scene{len(presets)}",
-                "label": "New scene",
-                "display": {"mode": "off"},
-                "audio": {"profile": "simple"},
-            }
-            store.setdefault("presets", []).append(tmpl)  # type: ignore[union-attr]
-            try:
-                pi8_presets.save_store(store)
-                row = len(store["presets"]) - 1  # type: ignore[arg-type]
-                status = f"added {tmpl['name']} — edit JSON if needed"
-            except (ValueError, OSError) as e:
-                status = str(e)
-        elif ch == ord("d"):
-            store["presets"].pop(row)  # type: ignore[union-attr]
-            try:
-                pi8_presets.save_store(store)
-                row = max(0, row - 1)
-                status = "deleted"
-            except (ValueError, OSError) as e:
-                status = str(e)
-        elif ch == ord("[") and row > 0:
-            pr = store["presets"]  # type: ignore[assignment]
-            pr[row - 1], pr[row] = pr[row], pr[row - 1]
-            row -= 1
-            try:
-                pi8_presets.save_store(store)
-                status = "moved up"
-            except (ValueError, OSError) as e:
-                status = str(e)
-        elif ch == ord("]") and row < len(presets) - 1:
-            pr = store["presets"]  # type: ignore[assignment]
-            pr[row + 1], pr[row] = pr[row], pr[row + 1]
-            row += 1
-            try:
-                pi8_presets.save_store(store)
-                status = "moved down"
-            except (ValueError, OSError) as e:
-                status = str(e)
-        elif ch == ord("e"):
-            ed = os.environ.get("EDITOR", "nano")
-            path = Path.home() / ".config" / "pi8-presets.json"
-            subprocess.run([ed, str(path)], check=False)
-            status = f"exit {ed}"
-        elif ch in (10, 13):
-            name = str(presets[row].get("name", "")).strip()
-            code, js = _json_req("POST", "/scene/apply", {"name": name})
-            ok = js.get("ok", code == 200)
-            status = f"apply {name} HTTP {code} ok={ok}"
 
 
 def main() -> int:
