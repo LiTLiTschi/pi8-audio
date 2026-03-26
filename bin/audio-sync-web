@@ -2011,7 +2011,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(502, {"ok": False, "msg": str(e)})
             return
-        if self.path not in ("/apply", "/balance", "/mode", "/volume", "/player", "/debug-volume", "/debug-test", "/source", "/network-config", "/buffers", "/restart-service", "/play-sync-test", "/calib-stream", "/presets", "/presets/load", "/presets/delete", "/hdmi", "/power", "/display", "/sleep-timer", "/display-mode", "/scene/apply", "/audio-profile"):
+        if self.path not in ("/apply", "/balance", "/mode", "/volume", "/player", "/debug-volume", "/debug-test", "/source", "/network-config", "/buffers", "/restart-service", "/play-sync-test", "/calib-stream", "/presets", "/presets/load", "/presets/delete", "/presets/schedule", "/hdmi", "/power", "/display", "/sleep-timer", "/display-mode", "/scene/apply", "/audio-profile"):
             self.send_json(404, {"ok": False, "msg": "not found"})
             return
 
@@ -2537,35 +2537,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=_do_apply, daemon=True).start()
             self.send_json(202, {"ok": True, "applying": True})
             return
-
-        target   = data.get("target")   # "front" | "rear" | None
-        delay_ms = float(data.get("delay_ms", 0))
-
-        if target not in (None, "front", "rear"):
-            self.send_json(400, {"ok": False, "msg": "invalid target"})
-            return
-        if delay_ms < 0 or delay_ms > 500:
-            self.send_json(400, {"ok": False, "msg": "delay out of range (0–500ms)"})
-            return
-
-        with _apply_lock:
-            state = load_state()
-            state["target"] = target if delay_ms > 0 else None
-            state["delay_ms"] = delay_ms
-            save_state(state)
-            try:
-                apply_state(state)
-            except subprocess.CalledProcessError as e:
-                self.send_json(500, {"ok": False, "msg": str(e)})
-                return
-
-        if not target or delay_ms == 0:
-            msg = "Kein Delay — auto latency-compensate aktiv."
-        else:
-            label = "3.5mm Front" if target == "front" else "USB Rear"
-            msg   = f"{label} +{delay_ms}ms Delay angewendet."
-
-        self.send_json(200, {"ok": True, "msg": msg})
 
     def do_DELETE(self):
         if self.path == "/sleep-timer":

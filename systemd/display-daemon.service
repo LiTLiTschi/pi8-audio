@@ -6,7 +6,7 @@ After=pipewire.service
 ExecStart=/home/liu/bin/display-daemon
 Restart=on-failure
 RestartSec=3
-Environment=PATH=/home/liu/.venv/bin:/usr/bin:/bin
+Environment=PATH=/home/liu/.venv/bin:/home/liu/.nvm/versions/node/v24.14.0/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target

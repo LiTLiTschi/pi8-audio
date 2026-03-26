@@ -8,7 +8,23 @@ from gi.repository import GLib
 AGENT_PATH = "/org/bluez/agent/pi8"
 CAPABILITY = "NoInputNoOutput"
 
+
+def _trust_device(bus, device_path: str) -> None:
+    """BlueZ often leaves Trusted=no after pair; phones then stall A2DP with no clear error."""
+    try:
+        dev = bus.get_object("org.bluez", device_path)
+        dbus.Interface(dev, "org.freedesktop.DBus.Properties").Set(
+            "org.bluez.Device1", "Trusted", dbus.Boolean(True)
+        )
+    except dbus.exceptions.DBusException as e:
+        print(f"Trust {device_path}: {e}")
+
+
 class Agent(dbus.service.Object):
+    def __init__(self, bus, path):
+        self._bus = bus
+        super().__init__(bus, path)
+
     @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
     def Release(self):
         print("Agent released")
@@ -16,6 +32,7 @@ class Agent(dbus.service.Object):
     @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
     def AuthorizeService(self, device, uuid):
         print(f"AuthorizeService: {device} uuid={uuid} — accepted")
+        _trust_device(self._bus, device)
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
     def RequestPinCode(self, device):
@@ -38,10 +55,12 @@ class Agent(dbus.service.Object):
     @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
     def RequestConfirmation(self, device, passkey):
         print(f"RequestConfirmation: {device} passkey={passkey} — accepted")
+        _trust_device(self._bus, device)
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
     def RequestAuthorization(self, device):
         print(f"RequestAuthorization: {device} — accepted")
+        _trust_device(self._bus, device)
 
     @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
     def Cancel(self):

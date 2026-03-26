@@ -316,3 +316,12 @@ def post_presets_load(name: str) -> Any:
 
 def post_presets_delete(name: str) -> Any:
     return _request("POST", "/presets/delete", {"name": name})
+
+
+def post_presets_schedule(name: str, schedule: Mapping[str, Any] | None) -> Any:
+    """POST /presets/schedule — set or clear (None) cron-like schedule for a preset."""
+    return _request(
+        "POST",
+        "/presets/schedule",
+        {"name": name.strip(), "schedule": schedule},
+    )

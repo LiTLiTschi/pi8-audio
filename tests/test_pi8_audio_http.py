@@ -413,6 +413,27 @@ class TestPi8AudioHttp(unittest.TestCase):
                 self.assertTrue(req.get_full_url().endswith("/presets/delete"))
                 self.assertEqual(json.loads(req.data.decode()), {"name": "x"})
 
+    def test_post_presets_schedule(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "presets": {}}).encode()
+                )
+                spec = {"cron": "0 8 * * *"}
+                pi8_audio_http.post_presets_schedule("morning", spec)
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/presets/schedule"))
+                self.assertEqual(
+                    json.loads(req.data.decode()),
+                    {"name": "morning", "schedule": spec},
+                )
+                pi8_audio_http.post_presets_schedule("morning", None)
+                req2 = m.call_args[0][0]
+                self.assertEqual(
+                    json.loads(req2.data.decode()),
+                    {"name": "morning", "schedule": None},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

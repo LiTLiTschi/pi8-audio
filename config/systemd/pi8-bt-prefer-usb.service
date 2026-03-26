@@ -1,0 +1,15 @@
+[Unit]
+Description=Pi8 audio — prefer USB Bluetooth adapter when present
+BindsTo=bluetooth.service
+After=bluetooth.service
+# Re-run ExecStart when bluetoothd is restarted (e.g. deploy.sh); otherwise hci
+# can stay DOWN and BlueZ reports Powered=no — pairing/discovery silently fails.
+PartOf=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/pi8-bt-prefer-usb.sh
+
+[Install]
+WantedBy=multi-user.target

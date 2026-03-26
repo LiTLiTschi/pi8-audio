@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Live status on TTY1 — what restarted, whether services are up, recent logs.
+# Ctrl+C → normal shell. Not run on SSH (see pi8-tty-login.sh).
+
+set +e
+REFRESH="${PI8_TTY_DASH_REFRESH:-15}"
+USER_UNITS=(pipewire pipewire-pulse wireplumber bt-speaker display-daemon audio-sync-web mpris-proxy)
+
+while true; do
+  clear
+  echo "══════════════════════════════════════════════════════════════════════════════"
+  echo "  Pi8 · $(date '+%Y-%m-%d %H:%M:%S %Z') · next refresh in ${REFRESH}s · Ctrl+C → shell"
+  echo "══════════════════════════════════════════════════════════════════════════════"
+  echo
+  echo "── Host / load ─────────────────────────────────────────────────────────────"
+  echo "  $(hostname) · $(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/')"
+  echo "  $(uptime | awk -F'load average:' '{print $2}')"
+  echo
+  echo "── System units ────────────────────────────────────────────────────────────"
+  printf "  %-14s %s\n" "bluetooth" "$(systemctl is-active bluetooth 2>/dev/null || echo '?')"
+  echo
+  echo "── User units (since = last start; helps spot restarts) ────────────────────"
+  for u in "${USER_UNITS[@]}"; do
+    st=$(systemctl --user is-active "$u" 2>/dev/null || echo "?")
+    since=$(systemctl --user show -p ActiveEnterTimestamp --value "$u" 2>/dev/null)
+    since=${since:-unknown}
+    printf "  %-18s %-10s  %s\n" "$u" "$st" "$since"
+  done
+  echo
+  echo "── journal: bluetooth (8 lines) ───────────────────────────────────────────"
+  journalctl -u bluetooth --no-pager -n 8 2>/dev/null | sed 's/^/  /' || echo "  (no journal access)"
+  echo
+  echo "── journal: display-daemon + audio-sync-web (8 lines, merged) ─────────────"
+  journalctl --user -u display-daemon -u audio-sync-web \
+    --no-pager -n 8 2>/dev/null | sed 's/^/  /' || echo "  (no journal access)"
+  echo
+  echo "── /tmp/pi8-audio.log (tail 8) ────────────────────────────────────────────"
+  if [ -r /tmp/pi8-audio.log ]; then
+    tail -n 8 /tmp/pi8-audio.log | sed 's/^/  /'
+  else
+    echo "  (file missing or not readable)"
+  fi
+  echo
+  echo "── Tip: pi8-audioctl status  ·  pi8-audioctl logs -f bt   ·  export PI8_TTY_DASH_REFRESH=5 ──"
+  sleep "$REFRESH"
+done

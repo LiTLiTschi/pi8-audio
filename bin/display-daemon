@@ -5,10 +5,12 @@ HTTP API on localhost:8084 — proxied by audio-sync-web.
 """
 
 import colorsys
+import difflib
 import hashlib
 import http.server
 import json
 import logging
+import logging.handlers
 import mmap
 import os
 import queue
@@ -24,11 +26,17 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+_LOG_FILE = "/tmp/pi8-audio.log"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.handlers.RotatingFileHandler(
+            _LOG_FILE, maxBytes=2*1024*1024, backupCount=1, encoding="utf-8"
+        ),
+    ],
 )
 log = logging.getLogger("display-daemon")
 
@@ -46,31 +54,348 @@ def load_display_config():
 
 _display_config = load_display_config()
 COVER_FILE = "/tmp/display-cover.jpg"
-NP_FILE    = "/tmp/now-playing.png"
-NP_FILE_TMP = "/tmp/now-playing-tmp.png"
+# Now-playing / mpv still image: JPEG is much faster to encode at 4K than PNG.
+NP_FILE = "/tmp/now-playing.jpg"
+NP_JPEG_QUALITY = max(75, min(98, int(os.environ.get("PI8_NP_JPEG_QUALITY", "92"))))
+# CAVA output rates (Hz). Tunable on big GPUs/CPUs; Pi may need lower values if CPU maxes out.
+VIS_CAVA_FRAMERATE = max(20, min(144, int(os.environ.get("PI8_VIS_FRAMERATE", "72"))))
+NP_CAVA_FRAMERATE = max(20, min(144, int(os.environ.get("PI8_NP_CAVA_FRAMERATE", "90"))))
+# Cap HDMI push rate: each tickJPEG-encodes full frame + mpv loadfile (4K is heavy).
+NP_OVERLAY_MAX_HZ = max(12, min(90, int(os.environ.get("PI8_NP_OVERLAY_MAX_HZ", "48"))))
 CF_DIR     = "/tmp/cf"
 MPV_SOCK   = "/tmp/mpv-display.sock"
-CAVA_CONF  = "/tmp/cava-display.conf"
+CAVA_CONF    = "/tmp/cava-display.conf"
+CAVA_NP_CONF = "/tmp/cava-np.conf"
 FONT_REG   = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
 FONT_BOLD  = "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"
 PORT       = 8084
 
+# Virtual terminals: console = login shell (default autologin VT1); blank = unused VT for DRM.
+# Override if autologin is not on VT1 (set sudoers NOPASSWD for your numbers).
+CONSOLE_VT = max(1, min(63, int(os.environ.get("PI8_CONSOLE_VT", "1"))))
+BLANK_VT   = max(1, min(63, int(os.environ.get("PI8_BLANK_VT", "2"))))
+if BLANK_VT == CONSOLE_VT:
+    BLANK_VT = CONSOLE_VT + 1 if CONSOLE_VT < 63 else max(1, CONSOLE_VT - 1)
+
+_RESOLUTION_FMT = {
+    "360p":  "bv[vcodec^=avc1][height<=360]+ba/bv[height<=360]+ba/b[height<=360]/b",
+    "480p":  "bv[vcodec^=avc1][height<=480]+ba/bv[height<=480]+ba/b[height<=480]/b",
+    "720p":  ("bv[vcodec^=avc1][height<=720]+ba"
+              "/bv[vcodec^=vp09][height<=720]+ba"
+              "/bv[height<=720]+ba/b[height<=720]/b"),
+    "1080p": "bv[vcodec^=avc1][height<=1080]+ba/bv[height<=1080]+ba/b[height<=1080]/b",
+    "best":  "bv+ba/b",
+}
+
 # ── Shared mutable state (all protected by _lock) ────────────────────────────
 _lock   = threading.Lock()
-_state  = {"mode": "off", "overlay_enabled": True, "visualizer_mirror": False, "visualizer_theme": "default", "lyrics_enabled": True}
-_track  = {"title": "", "artist": "", "artUrl": ""}
-_g      = {"status": "idle"}   # volatile string; use dict to avoid global rebind issues
+_mpv_lock = threading.Lock()  # serialize mpv IPC — interleaved loadfile causes DRM glitches
+_state  = {"mode": "off", "overlay_enabled": True, "visualizer_mirror": False,
+           "visualizer_theme": "default",
+           # Cava strip on now-playing art ("none" or same keys as visualizer themes).
+           "now_playing_visualizer": "none",
+           "lyrics_enabled": True,
+           # Smooth line crossfade (extra overlay work; default off for sharp, wrapped lines).
+           "lyrics_animation": False,
+           # Do not auto-switch to TTY when playerctl fails (flaky BT / MPRIS).
+           "audio_mode": True,
+           # Heard audio lags MPRIS position over Bluetooth; subtract this for lyric lookup.
+           "lyrics_avsync_lag_sec": 0.12,
+           "video_skip_threshold": 3,
+           "video_no_found_action": "skip",
+           "video_search_template": "{artist} {title} official music video",
+           "video_max_resolution": "720p",
+           "video_fuzzy_threshold": 0.0,
+           "video_max_candidates": 1,
+           "video_search_timeout": 30,
+           "video_fallback_enabled": False,
+           "video_fallback_template": "{artist} {title}",
+           "video_after_ends": "next",
+           "video_bt_mute": "always",
+           "video_must_include": "",
+           # Online cover lookup (when player has no art or user ignores MPRIS art)
+           "cover_art_online_enabled": True,
+           "cover_art_ignore_mpris": False,
+           "cover_art_providers": ["soundcloud", "deezer", "itunes"],
+           "cover_art_search_template": "{artist} {title}",
+           "cover_art_soundcloud_client_id": "",
+           "cover_art_itunes_country": "us",
+           "cover_art_per_provider_limit": 5,
+           "cover_art_pick_index": 0,
+           # api_order: Nth hit from the API; best_match: rank by similarity to metadata
+           "cover_art_ranking": "best_match",
+           # HDMI now-playing: show live audio/BT debug panel (Web UI toggle).
+           "now_playing_debug_overlay": False}
+_track  = {"title": "", "artist": "", "artUrl": "", "album": ""}
+_g      = {"status": "idle", "current_mode": "off"}  # current_mode mirrors display_controller
 _queue  : queue.Queue = queue.Queue()
+
+# Cached HDMI debug overlay lines + last audio sample (shared ~1 Hz unless force).
+_np_debug_lock = threading.Lock()
+_np_debug_sample: dict | None = None
+_np_debug_sample_t: float = 0.0
+_np_debug_cache_lines: list = []
+
+# Auto-detect BT/audio glitches (phone UI still "playing"). Logged + JSONL.
+HEALTH_LOG_PATH = Path("/tmp/pi8-audio-health.jsonl")
+HEALTH_LOG_MAX_BYTES = 400 * 1024
+_health_pos_track: dict = {"pos": None, "since": None}  # monotonic; position stickiness
+_health_emit_at: dict = {}  # kind -> monotonic last emit
+
+
+def _sh_out(args: list, timeout: float = 0.35) -> str:
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or "").strip()
+    except Exception as e:
+        return f"err:{type(e).__name__}"
+
+
+def _gather_np_debug_sample() -> dict:
+    """One snapshot: MPRIS, PipeWire, Bluetooth (subprocess bundle)."""
+    import datetime
+    # Pi under load: PipeWire queries can exceed sub-second timeouts and look like false "no BT input".
+    pc_timeout = float(os.environ.get("PI8_PLAYERCTL_TIMEOUT_SEC", "0.85"))
+    pactl_t = float(os.environ.get("PI8_PACTL_SHORT_TIMEOUT_SEC", "1.35"))
+    with _lock:
+        dm = _g.get("status", "?")
+        cm = _g.get("current_mode", "?")
+    st = _sh_out(["playerctl", "status"], pc_timeout) or "?"
+    pos_raw = _sh_out(["playerctl", "position"], pc_timeout)
+    len_raw = _sh_out(["playerctl", "metadata", "mpris:length"], max(0.35, pc_timeout * 0.8))
+    pos_sec = None
+    try:
+        if pos_raw:
+            pos_sec = float(pos_raw)
+    except ValueError:
+        pos_sec = None
+    duration_sec = None
+    try:
+        if len_raw:
+            duration_sec = int(float(len_raw)) / 1_000_000
+    except ValueError:
+        duration_sec = None
+    vol = _sh_out(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], 0.35) or "?"
+    pactl_in = _sh_out(
+        ["bash", "-lc", "pactl list short sink-inputs 2>/dev/null"], pactl_t
+    )
+    bt_lines = _sh_out(
+        ["bash", "-lc",
+         "(bluetoothctl show 2>/dev/null | head -1; bluetoothctl devices Connected 2>/dev/null | head -3)"
+         " | tr '\\n' ' ' | cut -c1-100"],
+        0.55,
+    )
+    hci_hint = _sh_out(
+        ["bash", "-lc", "hciconfig 2>/dev/null | head -14 | tr '\\n' '|' | cut -c1-90"],
+        0.45,
+    )
+    return {
+        "wall": datetime.datetime.now().strftime("%H:%M:%S"),
+        "disp_mode": cm,
+        "daemon_status": dm,
+        "mpris_status": st,
+        "position_raw": pos_raw,
+        "position_sec": pos_sec,
+        "duration_sec": duration_sec,
+        "wpctl_vol": vol,
+        "pactl_sink_inputs": pactl_in or "",
+        "bt_line": bt_lines,
+        "hci_line": hci_hint,
+    }
+
+
+def _format_np_debug_lines(s: dict) -> list:
+    import datetime
+    st = s.get("mpris_status") or "?"
+    pos_raw = s.get("position_raw") or ""
+    try:
+        pos_s = f"{float(pos_raw):.1f}s" if pos_raw else "0s"
+    except ValueError:
+        pos_s = (pos_raw or "?")[:10]
+    vol = s.get("wpctl_vol") or "?"
+    sinks_in = s.get("pactl_sink_inputs") or ""
+    sinks_in = " ".join(sinks_in.split())[:120] if sinks_in else "—"
+    bt_lines = s.get("bt_line") or ""
+    hci_hint = s.get("hci_line") or ""
+    return [
+        datetime.datetime.now().strftime("%H:%M:%S"),
+        f"disp {s.get('disp_mode')}  mpris_ui {s.get('daemon_status')}",
+        f"mpris {st}  pos {pos_s}",
+        f"sink {vol[:56]}",
+        f"inputs {sinks_in[:76]}",
+        f"bt {bt_lines[:84]}",
+        f"hci {hci_hint[:84]}",
+    ]
+
+
+def _get_np_debug_sample(force: bool) -> dict:
+    global _np_debug_sample, _np_debug_sample_t
+    now = time.monotonic()
+    with _np_debug_lock:
+        if (
+            not force
+            and _np_debug_sample is not None
+            and now - _np_debug_sample_t < 0.92
+        ):
+            return _np_debug_sample
+        sample = _gather_np_debug_sample()
+        _np_debug_sample = sample
+        _np_debug_sample_t = time.monotonic()
+        return sample
+
+
+def _append_health_jsonl(record: dict) -> None:
+    import datetime
+    record = {**record, "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    try:
+        with open(HEALTH_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+        if HEALTH_LOG_PATH.stat().st_size > HEALTH_LOG_MAX_BYTES:
+            text = HEALTH_LOG_PATH.read_text(encoding="utf-8", errors="replace")
+            tail = "\n".join(text.splitlines()[-500:]) + "\n"
+            HEALTH_LOG_PATH.write_text(tail, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _health_emit(kind: str, **data) -> None:
+    cooldown_s = float(data.pop("_cooldown_s", 50.0))
+    now = time.monotonic()
+    if now - _health_emit_at.get(kind, 0) < cooldown_s:
+        return
+    _health_emit_at[kind] = now
+    log.warning("[audio-health] %s %s", kind, data)
+    _append_health_jsonl({"kind": kind, **data})
+
+
+def _np_debug_health_eval(s: dict) -> None:
+    """Heuristics when the phone still shows playing but audio may have died on the Pi."""
+    st = (s.get("mpris_status") or "").strip().lower()
+    if st != "playing":
+        _health_pos_track["pos"] = None
+        _health_pos_track["since"] = None
+        return
+
+    pos = s.get("position_sec")
+    dur = s.get("duration_sec")
+    vol = s.get("wpctl_vol") or ""
+    pactl_raw = (s.get("pactl_sink_inputs") or "").strip()
+    bt_line = s.get("bt_line") or ""
+
+    if "MUTED" in vol.upper():
+        _health_emit("sink_muted_while_mpris_playing", wpctl=vol[:120])
+
+    near_end = (
+        isinstance(dur, (int, float))
+        and dur > 2
+        and isinstance(pos, (int, float))
+        and pos >= dur - 0.35
+    )
+
+    now_m = time.monotonic()
+    if isinstance(pos, (int, float)) and not near_end:
+        eps = 0.07
+        if _health_pos_track["pos"] is None:
+            _health_pos_track["pos"] = pos
+            _health_pos_track["since"] = now_m
+        elif abs(pos - _health_pos_track["pos"]) < eps:
+            stuck = now_m - (_health_pos_track["since"] or now_m)
+            if stuck >= 5.5:
+                _health_emit(
+                    "mpris_playing_position_stuck",
+                    position=round(pos, 2),
+                    stuck_seconds=round(stuck, 1),
+                    duration_sec=dur,
+                )
+                _health_pos_track["since"] = now_m
+        else:
+            _health_pos_track["pos"] = pos
+            _health_pos_track["since"] = now_m
+
+    pl = pactl_raw.lower()
+    has_bluez = "bluez" in pl
+    has_bt_connected = "device" in bt_line.lower()
+    pactl_ok = bool(pactl_raw) and not pactl_raw.startswith("err:")
+
+    if pactl_ok and has_bt_connected and not has_bluez:
+        _health_emit(
+            "playing_bt_connected_but_no_bluez_sink_input",
+            pactl_short=pactl_raw.replace("\n", " ")[:200],
+            _cooldown_s=75.0,
+        )
+
+    if has_bt_connected and not pactl_raw:
+        _health_emit("playing_bt_connected_no_sink_inputs", bt=bt_line[:120])
+
+    if pactl_raw.startswith("err:"):
+        _health_emit(
+            "pactl_sink_inputs_failed",
+            detail=pactl_raw[:160],
+            _cooldown_s=120.0,
+        )
+
+
+def _collect_now_playing_debug_lines() -> list:
+    """MPRIS / PipeWire / BT snapshot for on-screen troubleshooting."""
+    global _np_debug_cache_lines
+    s = _get_np_debug_sample(force=False)
+    lines = _format_np_debug_lines(s)
+    _np_debug_cache_lines = lines
+    return lines
+
+
+def _audio_health_watcher():
+    """Background ~3s sampling; detects common 'playing but silent' signatures."""
+    time.sleep(4.0)
+    while True:
+        try:
+            s = _get_np_debug_sample(force=True)
+            _np_debug_health_eval(s)
+        except Exception as ex:
+            log.debug("audio health: %s", ex)
+        time.sleep(2.9)
+
+
+def composite_np_debug_overlay(frame: "Image.Image", lines: list) -> None:
+    """Semi-transparent panel top-left (mutates frame)."""
+    if not lines:
+        return
+    W, H = frame.size
+    scale = H / 1080
+    pad = max(6, int(10 * scale))
+    try:
+        font = ImageFont.truetype(FONT_REG, max(13, int(20 * scale)))
+    except Exception:
+        font = ImageFont.load_default()
+    draw_tmp = ImageDraw.Draw(frame)
+    max_w = 0
+    for line in lines:
+        bbox = draw_tmp.textbbox((0, 0), line, font=font)
+        max_w = max(max_w, bbox[2] - bbox[0])
+    line_h = max(16, int(22 * scale))
+    inner_pad = max(5, int(8 * scale))
+    box_w = min(W - pad * 2, max_w + inner_pad * 2)
+    box_h = inner_pad * 2 + line_h * len(lines)
+    overlay = Image.new("RGBA", (box_w, box_h), (8, 12, 8, 210))
+    frame.paste(overlay, (pad, pad), overlay)
+    draw = ImageDraw.Draw(frame)
+    y = pad + inner_pad
+    x_text = pad + inner_pad
+    for line in lines:
+        draw.text((x_text, y), line[:110], font=font, fill=(140, 255, 150))
+        y += line_h
 
 
 # ── Event types ───────────────────────────────────────────────────────────────
 class MetadataEvent:
-    __slots__ = ("title", "artist", "artUrl", "album")
-    def __init__(self, title, artist, artUrl, album=""):
+    __slots__ = ("title", "artist", "artUrl", "album", "force")
+    def __init__(self, title, artist, artUrl, album="", force=False):
         self.title  = title
         self.artist = artist
         self.artUrl = artUrl
         self.album  = album
+        self.force  = force
 
 class StatusEvent:
     __slots__ = ("status",)
@@ -102,9 +427,10 @@ def save_state(s):
 
 
 def save_np_frame(img: "Image.Image"):
-    """Atomically write a PIL image to NP_FILE to prevent partial-read races."""
-    img.save(NP_FILE_TMP)
-    os.rename(NP_FILE_TMP, NP_FILE)
+    """Atomically write the now-playing still for mpv. JPEG keeps 4K updates affordable."""
+    tmp = f"/tmp/now-playing-tmp-{threading.get_ident()}.jpg"
+    img.save(tmp, "JPEG", quality=NP_JPEG_QUALITY, optimize=False)
+    os.rename(tmp, NP_FILE)
 
 
 def append_history(title: str, artist: str, album: str = ""):
@@ -132,80 +458,192 @@ def append_history(title: str, artist: str, album: str = ""):
 import collections as _collections
 _art_cache: _collections.OrderedDict = _collections.OrderedDict()
 _ART_CACHE_MAX = 500
+_COVER_PROVIDERS = frozenset({"deezer", "itunes", "soundcloud"})
+
+
+def _cover_state_sig() -> tuple:
+    with _lock:
+        sid = (_state.get("cover_art_soundcloud_client_id") or "").strip()
+        prov = _state.get("cover_art_providers")
+        if not isinstance(prov, list):
+            prov = ["soundcloud", "deezer", "itunes"]
+        cc_raw = (_state.get("cover_art_itunes_country") or "us").lower().strip()
+        cc = cc_raw[:2] if len(cc_raw) >= 2 else "us"
+        return (
+            bool(_state.get("cover_art_online_enabled", True)),
+            bool(_state.get("cover_art_ignore_mpris", False)),
+            tuple(p for p in prov if p in _COVER_PROVIDERS),
+            (_state.get("cover_art_search_template") or "{artist} {title}").strip(),
+            sid or (_display_config.get("soundcloud_client_id") or "").strip(),
+            cc,
+            max(1, min(15, int(_state.get("cover_art_per_provider_limit", 5)))),
+            max(0, min(9, int(_state.get("cover_art_pick_index", 0)))),
+            (_state.get("cover_art_ranking") or "best_match"),
+        )
+
+
+def _cover_format_query(tmpl: str, artist: str, title: str, album: str) -> str:
+    artist = (artist or "").strip()
+    title = (title or "").strip()
+    album = (album or "").strip()
+    try:
+        q = tmpl.format(artist=artist, title=title, album=album).strip()
+    except Exception:
+        q = f"{artist} {title}".strip()
+    return q[:500] if q else f"{artist} {title}".strip()[:500]
+
+
+def _cover_track_score(meta_artist: str, meta_title: str,
+                       c_artist: str, c_title: str) -> float:
+    a = f"{meta_artist} {meta_title}".lower().strip()
+    b = f"{c_artist} {c_title}".lower().strip()
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _cover_pick(cands: list, meta_artist: str, meta_title: str,
+                ranking: str, pick_index: int) -> str:
+    if not cands:
+        return ""
+    ranking = ranking if ranking in ("api_order", "best_match") else "best_match"
+    if ranking == "api_order":
+        i = min(max(0, pick_index), len(cands) - 1)
+        return cands[i]["url"]
+    scored = sorted(
+        cands,
+        key=lambda c: _cover_track_score(
+            meta_artist, meta_title, c.get("artist", ""), c.get("title", "")),
+        reverse=True,
+    )
+    i = min(max(0, pick_index), len(scored) - 1)
+    return scored[i]["url"]
+
+
+def _deezer_candidates(query: str, limit: int) -> list:
+    out = []
+    try:
+        q = urllib.parse.quote(query)
+        req = urllib.request.Request(
+            f"https://api.deezer.com/search?q={q}&limit={limit}",
+            headers={"User-Agent": "display-daemon/2.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        for item in data.get("data", [])[:limit]:
+            alb = item.get("album", {})
+            url = (alb.get("cover_xl") or alb.get("cover_big")
+                   or alb.get("cover_medium"))
+            if not url:
+                continue
+            ca = item.get("artist", {}).get("name", "")
+            ct = item.get("title", "")
+            out.append({"url": url, "artist": ca, "title": ct})
+    except Exception as e:
+        log.debug("Deezer lookup failed: %s", e)
+    return out
+
+
+def _itunes_candidates(query: str, limit: int, country: str) -> list:
+    out = []
+    cc = (country or "us").lower()
+    if len(cc) != 2:
+        cc = "us"
+    try:
+        q = urllib.parse.quote(query)
+        req = urllib.request.Request(
+            f"https://itunes.apple.com/search?term={q}&entity=musicTrack&limit={limit}&country={cc}",
+            headers={"User-Agent": "display-daemon/2.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        for r in data.get("results", [])[:limit]:
+            art = r.get("artworkUrl100", "")
+            if not art:
+                continue
+            url = art.replace("100x100bb.jpg", "600x600bb.jpg")
+            ca = r.get("artistName", "")
+            ct = r.get("trackName", "")
+            out.append({"url": url, "artist": ca, "title": ct})
+    except Exception as e:
+        log.debug("iTunes lookup failed: %s", e)
+    return out
+
+
+def _soundcloud_candidates(query: str, limit: int, client_id: str) -> list:
+    out = []
+    if not client_id:
+        return out
+    try:
+        q = urllib.parse.quote(query)
+        req = urllib.request.Request(
+            f"https://api.soundcloud.com/tracks?q={q}&client_id={client_id}&limit={limit}",
+            headers={"User-Agent": "display-daemon/2.0"})
+        raw = urllib.request.urlopen(req, timeout=5).read()
+        data = json.loads(raw)
+        tracks = data if isinstance(data, list) else []
+        for track in tracks[:limit]:
+            art = track.get("artwork_url") or track.get("user", {}).get("avatar_url", "")
+            if not art:
+                continue
+            url = art.replace("large", "t500x500")
+            ut = track.get("user") or {}
+            ca = (ut.get("full_name") or ut.get("username") or "")
+            ct = track.get("title", "")
+            out.append({"url": url, "artist": ca, "title": ct})
+    except Exception as e:
+        log.debug("SoundCloud lookup failed: %s", e)
+    return out
+
 
 def get_cover_art(artist: str, title: str, album: str = "") -> str:
-    """Fetch cover art URL. Tries SoundCloud → Deezer → iTunes. Returns "" on failure."""
-    key = (artist.lower(), title.lower())
+    """Resolve cover URL using configured providers, query template, and ranking."""
+    sig = _cover_state_sig()
+    if not sig[0]:
+        return ""
+    key = (sig, artist.lower(), (title or "").lower(), (album or "").lower().strip())
     if key in _art_cache:
         _art_cache.move_to_end(key)
         return _art_cache[key]
 
-    url = (_sc_cover(artist, title)
-           or _deezer_cover(artist, title)
-           or _itunes_cover(artist, title))
+    order = sig[2]
+    if not order:
+        _art_cache[key] = ""
+        _art_cache.move_to_end(key)
+        if len(_art_cache) > _ART_CACHE_MAX:
+            _art_cache.popitem(last=False)
+        return ""
+    tmpl = sig[3]
+    sc_id = sig[4]
+    country = sig[5]
+    lim = sig[6]
+    pick_idx = sig[7]
+    ranking = sig[8]
+
+    qtext = _cover_format_query(tmpl, artist, title, album)
+    if not qtext:
+        _art_cache[key] = ""
+        return ""
+
+    url = ""
+    for prov in order:
+        if prov == "deezer":
+            cands = _deezer_candidates(qtext, lim)
+        elif prov == "itunes":
+            cands = _itunes_candidates(qtext, lim, country)
+        elif prov == "soundcloud":
+            cands = _soundcloud_candidates(qtext, lim, sc_id)
+        else:
+            continue
+        url = _cover_pick(cands, artist, title, ranking, pick_idx)
+        if url:
+            break
 
     _art_cache[key] = url or ""
     _art_cache.move_to_end(key)
     if len(_art_cache) > _ART_CACHE_MAX:
         _art_cache.popitem(last=False)
     if url:
-        log.info("cover art found for %r — %r", artist, title)
+        log.info("cover art found for %r — %r (provider chain)", artist, title)
     else:
-        log.info("no cover art found for %r — %r (will use gradient)", artist, title)
+        log.info("no cover art for %r — %r (gradient / player art only)", artist, title)
     return _art_cache[key]
-
-
-def _sc_cover(artist: str, title: str) -> str:
-    client_id = _display_config.get("soundcloud_client_id", "")
-    if not client_id:
-        return ""
-    try:
-        q = urllib.parse.quote(f"{artist} {title}")
-        req = urllib.request.Request(
-            f"https://api.soundcloud.com/tracks?q={q}&client_id={client_id}&limit=3",
-            headers={"User-Agent": "display-daemon/2.0"})
-        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
-        for track in data:
-            art = track.get("artwork_url") or track.get("user", {}).get("avatar_url", "")
-            if art:
-                return art.replace("large", "t500x500")
-    except Exception as e:
-        log.debug("SoundCloud lookup failed: %s", e)
-    return ""
-
-
-def _deezer_cover(artist: str, title: str) -> str:
-    try:
-        q = urllib.parse.quote(f"{artist} {title}")
-        req = urllib.request.Request(
-            f"https://api.deezer.com/search?q={q}&limit=5",
-            headers={"User-Agent": "display-daemon/2.0"})
-        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
-        for item in data.get("data", []):
-            album = item.get("album", {})
-            url = album.get("cover_xl") or album.get("cover_big") or album.get("cover_medium")
-            if url:
-                return url
-    except Exception as e:
-        log.debug("Deezer lookup failed: %s", e)
-    return ""
-
-
-def _itunes_cover(artist: str, title: str) -> str:
-    try:
-        q = urllib.parse.quote(f"{artist} {title}")
-        req = urllib.request.Request(
-            f"https://itunes.apple.com/search?term={q}&entity=musicTrack&limit=1",
-            headers={"User-Agent": "display-daemon/2.0"})
-        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
-        results = data.get("results", [])
-        if results:
-            art = results[0].get("artworkUrl100", "")
-            if art:
-                return art.replace("100x100bb.jpg", "600x600bb.jpg")
-    except Exception as e:
-        log.debug("iTunes lookup failed: %s", e)
-    return ""
 
 
 # ── LRCLIB lyrics ─────────────────────────────────────────────────────────────
@@ -216,13 +654,28 @@ _lyrics_data = {"synced": [], "plain": [], "artist": "", "title": ""}
 # plain:  list of line_text strings
 
 def _parse_synced(text: str) -> list:
-    """Parse [MM:SS.cs] lines → [(secs, text), ...]"""
+    """Parse LRC timestamps → [(secs, text), ...]. Supports [mm:ss], [mm:ss.xx], [mm:ss.xxx]."""
     result = []
+    pat = _re.compile(r"\[(\d+):(\d+)(?:\.(\d+))?\](.*)")
     for line in text.splitlines():
-        m = _re.match(r'\[(\d+):(\d+\.\d+)\](.*)', line)
-        if m:
-            secs = int(m.group(1)) * 60 + float(m.group(2))
-            result.append((secs, m.group(3).strip()))
+        m = pat.match(line.strip())
+        if not m:
+            continue
+        mins = int(m.group(1))
+        sec_i = int(m.group(2))
+        frac = m.group(3)
+        if frac is None:
+            sub = 0.0
+        elif len(frac) == 2:
+            sub = int(frac) / 100.0
+        elif len(frac) == 3:
+            sub = int(frac) / 1000.0
+        else:
+            sub = int(frac) / (10 ** len(frac))
+        t = mins * 60 + sec_i + sub
+        txt = m.group(4).strip()
+        if txt or t == 0.0:
+            result.append((t, txt))
     return sorted(result, key=lambda x: x[0])
 
 def fetch_lyrics(artist: str, title: str):
@@ -250,17 +703,126 @@ def fetch_lyrics(artist: str, title: str):
 
 def get_lyrics_lines(position_secs: float) -> tuple:
     """Return (current_line, next_line) for the given position."""
+    with _lock:
+        lag = max(-0.5, min(1.5, float(_state.get("lyrics_avsync_lag_sec", 0.12))))
     with _lyrics_lock:
         synced = list(_lyrics_data["synced"])
-    if synced:
-        idx = 0
-        for i, (t, _) in enumerate(synced):
-            if t <= position_secs:
-                idx = i
-        cur = synced[idx][1] if synced else ""
-        nxt = synced[idx + 1][1] if idx + 1 < len(synced) else ""
-        return cur[:60], nxt[:60]
-    return "", ""
+    if not synced:
+        return "", ""
+    pos = max(0.0, position_secs - lag)
+    if pos < synced[0][0]:
+        return "", (synced[0][1] or "").strip()
+    idx = 0
+    for i, (t, _) in enumerate(synced):
+        if t <= pos:
+            idx = i
+    cur = (synced[idx][1] or "").strip()
+    nxt = ((synced[idx + 1][1] if idx + 1 < len(synced) else "") or "").strip()
+    return cur, nxt
+
+
+def _wrap_lyric_lines(text: str, font, draw: ImageDraw.ImageDraw, max_width: int) -> list:
+    """Word-wrap for subtitle-width lyrics (no arbitrary character cut-off)."""
+    text = (text or "").replace("\n", " ").strip()
+    if not text:
+        return []
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip() if cur else w
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        tw = bbox[2] - bbox[0]
+        if tw <= max_width:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _lyrics_smoothstep(p: float) -> float:
+    p = max(0.0, min(1.0, p))
+    return p * p * (3.0 - 2.0 * p)
+
+
+def composite_lyrics_on_frame(
+    frame: "Image.Image",
+    W: int,
+    H: int,
+    cur: str,
+    nxt: str,
+    outgoing: str,
+    anim_elapsed: float,
+    anim_dur: float,
+    *,
+    animated: bool,
+) -> None:
+    """Draw synced lyrics. Default (animated=False): word-wrapped, bottom-anchored. Optional: slide/fade."""
+    if not cur and not outgoing and not nxt:
+        return
+    scale = H / 1080
+    try:
+        fl = ImageFont.truetype(FONT_REG, int(32 * scale))
+        fln = ImageFont.truetype(FONT_REG, int(28 * scale))
+    except Exception:
+        fl = fln = ImageFont.load_default()
+    draw = ImageDraw.Draw(frame)
+    cx = W // 2
+    max_w = int(W * 0.88)
+    bottom_margin = max(int(H * 0.016), 8)
+
+    if not animated:
+        line_h_cur = max(int(32 * scale) + 8, 30)
+        line_h_nxt = max(int(28 * scale) + 6, 26)
+        gap = int(14 * scale)
+        nxt_lines = _wrap_lyric_lines(nxt, fln, draw, max_w)[:3]
+        cur_lines = _wrap_lyric_lines(cur, fl, draw, max_w)[:8]
+        total_h = (
+            len(cur_lines) * line_h_cur
+            + (gap if nxt_lines else 0)
+            + len(nxt_lines) * line_h_nxt
+        )
+        y = H - bottom_margin - total_h + line_h_cur // 2
+        for ln in cur_lines:
+            for dx, dy, col in ((1, 1, (0, 0, 0)), (0, 0, (255, 255, 255))):
+                draw.text((cx + dx, y + dy), ln, font=fl, fill=col, anchor="mm")
+            y += line_h_cur
+        if nxt_lines:
+            y += gap - line_h_cur // 2 + line_h_nxt // 2
+            for ln in nxt_lines:
+                draw.text((cx, y), ln, font=fln, fill=(170, 170, 170), anchor="mm")
+                y += line_h_nxt
+        return
+
+    cur_s = (_wrap_lyric_lines(cur, fl, draw, max_w) or [""])[0]
+    out_s = (_wrap_lyric_lines(outgoing, fl, draw, max_w) or [""])[0] if outgoing else ""
+    nxt_s = (_wrap_lyric_lines(nxt, fln, draw, max_w) or [""])[0] if nxt else ""
+    if not cur_s and not out_s and not nxt_s:
+        return
+    ly = int(H * 0.91)
+    ly2 = int(H * 0.96)
+    p = anim_elapsed / anim_dur if anim_dur > 0 else 1.0
+    p = max(0.0, min(1.0, p))
+    ease = _lyrics_smoothstep(p)
+
+    if out_s and p < 1.0:
+        y_out = ly - int(ease * 42)
+        g = int(255 - 150 * ease)
+        col_out = (g, g, g)
+        for dx, dy, col in ((1, 1, (0, 0, 0)), (0, 0, col_out)):
+            draw.text((cx + dx, y_out + dy), out_s, font=fl, fill=col, anchor="mm")
+
+    if cur_s:
+        y_cur = ly + int((1.0 - ease) * 34)
+        for dx, dy, col in ((1, 1, (0, 0, 0)), (0, 0, (255, 255, 255))):
+            draw.text((cx + dx, y_cur + dy), cur_s, font=fl, fill=col, anchor="mm")
+
+    if nxt_s:
+        y_n = ly2 + int((1.0 - ease) * 10)
+        draw.text((cx, y_n), nxt_s, font=fln, fill=(180, 180, 180), anchor="mm")
 
 
 def gradient_from_artist(artist: str, W: int, H: int) -> "Image.Image":
@@ -332,15 +894,13 @@ def fb_clear(fb_mm, w, h, bpp_bytes):
 
 
 # ── mpv IPC helpers ───────────────────────────────────────────────────────────
-def _mpv_send(cmd: list):
-    """Send one command to mpv IPC; return the first JSON response line."""
+def _mpv_tx(cmd: list) -> dict:
+    """Single mpv IPC round-trip (caller must hold _mpv_lock for sequences)."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.settimeout(2.0)
         s.connect(MPV_SOCK)
         s.sendall(json.dumps({"command": cmd}).encode() + b"\n")
-        # mpv may send multiple newline-delimited JSON objects (response + events).
-        # Only parse the first complete line — the command response.
         buf = b""
         while b"\n" not in buf:
             chunk = s.recv(4096)
@@ -352,12 +912,20 @@ def _mpv_send(cmd: list):
     finally:
         s.close()
 
+
+def _mpv_send(cmd: list):
+    """Send one command to mpv IPC; return the first JSON response line."""
+    with _mpv_lock:
+        return _mpv_tx(cmd)
+
+
 def mpv_loadfile(path_or_url, loop=False):
-    try:
-        _mpv_send(["set_property", "loop-file", "inf" if loop else "no"])
-    except Exception:
-        pass
-    _mpv_send(["loadfile", path_or_url, "replace"])
+    with _mpv_lock:
+        try:
+            _mpv_tx(["set_property", "loop-file", "inf" if loop else "no"])
+        except Exception:
+            pass
+        _mpv_tx(["loadfile", path_or_url, "replace"])
 
 def mpv_stop():
     _mpv_send(["stop"])
@@ -383,7 +951,7 @@ def mpv_wait_ready(timeout=10.0):
 
 def mpv_wait_end_file():
     """Block until mpv fires end-file event or queue has a new item.
-    Returns True = video ended normally, False = interrupted."""
+    Returns True = video ended normally (eof/quit), False = interrupted or error."""
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.5)
@@ -396,13 +964,16 @@ def mpv_wait_end_file():
                 try:
                     chunk = s.recv(4096)
                     if not chunk:
-                        return True
+                        # mpv socket closed — treat as crash, not normal end
+                        return False
                     buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         try:
-                            if json.loads(line).get("event") == "end-file":
-                                return True
+                            obj = json.loads(line)
+                            if obj.get("event") == "end-file":
+                                reason = obj.get("reason", "eof")
+                                return reason in ("eof", "quit")
                         except Exception:
                             pass
                 except socket.timeout:
@@ -410,7 +981,7 @@ def mpv_wait_end_file():
         finally:
             s.close()
     except Exception:
-        return True
+        return False  # can't connect = mpv dead
 
 
 # ── Pillow: now-playing frame ─────────────────────────────────────────────────
@@ -442,9 +1013,12 @@ def _dominant_colour(img: "Image.Image") -> tuple:
 
 def render_now_playing(title, artist, artUrl, overlay_enabled, W, H, album="",
                        lyrics_line="", lyrics_next=""):
-    # Resolve cover art: MPRIS artUrl → online lookup → None
-    resolved_url = artUrl
-    if not resolved_url and (artist or title):
+    # Cover: MPRIS artUrl (optional) → online lookup → gradient
+    with _lock:
+        ignore_mpris = bool(_state.get("cover_art_ignore_mpris", False))
+        online_ok = bool(_state.get("cover_art_online_enabled", True))
+    resolved_url = "" if ignore_mpris else artUrl
+    if not resolved_url and online_ok and (artist or title):
         resolved_url = get_cover_art(artist, title, album)
 
     if not resolved_url:
@@ -550,27 +1124,33 @@ def render_clock_frame(W: int, H: int) -> "Image.Image":
 
 
 # ── Crossfade ─────────────────────────────────────────────────────────────────
+def _parse_cava_ascii_line(line: str) -> list:
+    """Parse one raw/ascii cava frame (semicolon- or whitespace-separated ints)."""
+    line = (line or "").strip()
+    if not line:
+        return []
+    parts = [p for p in line.split(";") if p.strip()]
+    if len(parts) <= 1 and (" " in line or "\t" in line):
+        parts = line.replace("\t", " ").split()
+    out = []
+    for p in parts:
+        try:
+            out.append(int(float(p)))
+        except ValueError:
+            continue
+    return out
+
+
 def crossfade_to(old_frame, new_frame, W, H):
-    os.makedirs(CF_DIR, exist_ok=True)
-    old = old_frame if old_frame is not None else Image.new("RGB", (W, H), (0,0,0))
-    # Use JPEG (not PNG) for intermediate frames — encoding is ~10x faster on Pi4.
-    # 10 frames is visually smooth and halves the blend work vs. 20.
-    paths = []
-    for i in range(10):
-        blend = Image.blend(old, new_frame, (i + 1) / 10)
-        p = f"{CF_DIR}/frame-{i:02d}.jpg"
-        blend.save(p, "JPEG", quality=85, optimize=False)
-        paths.append(p)
-    try:
-        for p in paths:
-            mpv_loadfile(p)
-            time.sleep(1 / 30)
-        save_np_frame(new_frame)
+    """Switch art with at most one extra mpv load — many loadfiles were causing DRM/fbcon flashes."""
+    old = old_frame if old_frame is not None else Image.new("RGB", (W, H), (0, 0, 0))
+    if old_frame is not None:
+        mid = Image.blend(old, new_frame, 0.5)
+        save_np_frame(mid)
         mpv_loadfile(NP_FILE, loop=True)
-    finally:
-        for p in paths:
-            try: os.unlink(p)
-            except Exception: pass
+        time.sleep(0.04)
+    save_np_frame(new_frame)
+    mpv_loadfile(NP_FILE, loop=True)
 
 
 # ── Visualizer frame ──────────────────────────────────────────────────────────
@@ -601,22 +1181,120 @@ def render_vis_frame(bars, W, H, mirror, pixel_format=4, theme="default"):
     return img
 
 
+def render_vis_strip(bars, W, H_strip, mirror, theme="default"):
+    """Bottom-aligned spectrum bars in a short strip (for now-playing overlay)."""
+    img = Image.new("RGB", (W, H_strip), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    n = max(len(bars), 1)
+    slot_w = W / n
+    bar_w = max(1, int(slot_w * 0.6))
+    theme_fn = _VIS_THEMES.get(theme, _VIS_THEMES["default"])
+    for i, val in enumerate(bars):
+        bar_h = int(val / 1000 * H_strip)
+        if val > 0 and bar_h < 1:
+            bar_h = 1
+        if bar_h == 0:
+            continue
+        x0 = int(i * slot_w + (slot_w - bar_w) / 2)
+        colour = theme_fn(val / 1000)
+        draw.rectangle([x0, H_strip - bar_h, x0 + bar_w - 1, H_strip - 1], fill=colour)
+        if mirror:
+            draw.rectangle([x0, 0, x0 + bar_w - 1, bar_h - 1], fill=colour)
+    return img
+
+
+def composite_now_playing_vis(frame, W, H, bars, theme, mirror):
+    """Blend a cava strip into the cover (below title, above lyrics)."""
+    if bars is None:
+        return
+    h_strip = max(int(H * 0.12), 64)
+    y0 = int(H * 0.72)
+    if y0 + h_strip > int(H * 0.89):
+        y0 = max(0, int(H * 0.89) - h_strip)
+    strip = render_vis_strip(bars, W, h_strip, mirror, theme)
+    region = frame.crop((0, y0, W, y0 + h_strip))
+    blended = Image.blend(region, strip, 0.88)
+    frame.paste(blended, (0, y0))
+
+
 # ── YouTube search ────────────────────────────────────────────────────────────
-def find_video_url(artist, title):
+def _match_score(video_title: str, artist: str, title: str) -> float:
+    expected = f"{artist} {title}".lower()
+    return difflib.SequenceMatcher(None, expected, video_title.lower()).ratio()
+
+
+def find_video_url(query: str, *, max_candidates: int = 1, timeout: int = 30,
+                   fuzzy_threshold: float = 0.0, artist: str = "", title: str = "",
+                   must_include: str = ""):
+    """Search YouTube and return best-matching watch URL, or None."""
     try:
         r = subprocess.run(
-            ["yt-dlp", "--no-playlist", "--print", "url", "--quiet",
-             "--format", "best[ext=mp4]/bestvideo*+bestaudio/best",
-             f"ytsearch1:{artist} {title} official music video"],
-            capture_output=True, text=True, timeout=30)
-        lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
-        return lines[0] if lines else None
+            ["yt-dlp", "--no-playlist",
+             "--print", "%(webpage_url)s|||%(title)s",
+             "--quiet", "--js-runtimes", "node",
+             f"ytsearch{max_candidates}:{query}"],
+            capture_output=True, text=True, timeout=timeout)
+        candidates = []
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if "|||" not in line:
+                continue
+            url_part, vid_title = line.split("|||", 1)
+            if "youtube.com" not in url_part:
+                continue
+            if must_include:
+                terms = [t.strip().lower() for t in must_include.split(",") if t.strip()]
+                if not all(t in vid_title.lower() for t in terms):
+                    log.info("music-video: skipping %r — missing required terms %r", vid_title, terms)
+                    continue
+            score = _match_score(vid_title, artist, title) if fuzzy_threshold > 0 else 1.0
+            candidates.append((score, url_part, vid_title))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_url, best_title = candidates[0]
+        if fuzzy_threshold > 0 and best_score < fuzzy_threshold:
+            log.info("music-video: best match %r score %.2f < threshold %.2f — rejected",
+                     best_title, best_score, fuzzy_threshold)
+            return None
+        log.info("music-video: found %r (score %.2f): %s", best_title, best_score, best_url)
+        return best_url
     except subprocess.TimeoutExpired:
-        log.warning("yt-dlp search timed out for %r — %r", artist, title)
+        log.warning("yt-dlp search timed out for %r", query)
         return None
     except Exception as e:
         log.debug("yt-dlp error: %s", e)
         return None
+
+
+def _apply_resolution_to_mpv(res: str):
+    """Push updated ytdl-format to running mpv — takes effect on next loadfile."""
+    fmt = _RESOLUTION_FMT.get(res, _RESOLUTION_FMT["720p"])
+    try:
+        with _mpv_lock:
+            _mpv_tx(["set_property", "ytdl-format", fmt])
+        log.info("mpv: ytdl-format updated to %s", res)
+    except Exception:
+        pass  # mpv not running — will pick up on next launch
+
+
+def bt_mute(mute: bool):
+    """Mute/unmute all BT A2DP sink-inputs in PipeWire via pactl."""
+    try:
+        r = subprocess.run(["pactl", "list", "sink-inputs"],
+                           capture_output=True, text=True, timeout=3)
+        current_id = None
+        for line in r.stdout.splitlines():
+            m = _re.match(r"Sink Input #(\d+)", line)
+            if m:
+                current_id = m.group(1)
+            elif current_id and "bluez_input" in line:
+                subprocess.run(["pactl", "set-sink-input-mute", current_id,
+                                "1" if mute else "0"], check=False, timeout=2)
+                log.info("bt_mute %s → sink-input #%s", "on" if mute else "off", current_id)
+                current_id = None
+    except Exception as e:
+        log.warning("bt_mute failed: %s", e)
 
 
 # ── MPRIS watchers ────────────────────────────────────────────────────────────
@@ -689,8 +1367,12 @@ def display_controller():
     fb_bpp       = [4]
     fb_W         = [W]
     fb_H         = [H]
-    vis_stop     = threading.Event()
-    lyrics_stop  = threading.Event()
+    vis_stop      = threading.Event()
+    lyrics_stop   = threading.Event()
+    np_cava_stop  = threading.Event()
+    np_cava_proc  = [None]
+    np_vis_bars   = [None]
+    np_cava_retry_not_before = [0.0]  # back off after failed spawn (avoid log/CPU storm)
     current_mode = "off"
     old_frame    = [None]
     base_frame   = [None]  # full render without lyrics — reused by lyrics updater
@@ -705,6 +1387,7 @@ def display_controller():
 
     # ── mpv lifecycle ──────────────────────────────────────────────────────────
     def launch_mpv():
+        """Spawn mpv for DRM output; return True once IPC socket accepts (else False)."""
         connector, _, _ = detect_connector()
         # mpv expects short name e.g. "HDMI-A-2", not sysfs name "card1-HDMI-A-2"
         mpv_connector = connector.split("-", 1)[1]
@@ -713,15 +1396,34 @@ def display_controller():
             try: mpv_proc[0].wait(timeout=3)
             except subprocess.TimeoutExpired: mpv_proc[0].kill()
         save_np_frame(Image.new("RGB", (W, H), (0,0,0)))
+        with _lock:
+            res = _state.get("video_max_resolution", "720p")
+        ytdl_fmt = _RESOLUTION_FMT.get(res, _RESOLUTION_FMT["720p"])
         mpv_proc[0] = subprocess.Popen(
             ["mpv", "--vo=drm", f"--drm-connector={mpv_connector}", "--fullscreen",
              f"--input-ipc-server={MPV_SOCK}",
              "--no-terminal", "--idle=yes",
              "--ao=pipewire", "--audio-device=pipewire/combined",
+             f"--ytdl-format={ytdl_fmt}",
+             "--ytdl-raw-options=js-runtimes=node",
              NP_FILE],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not mpv_wait_ready(5.0):
-            print("display-daemon: mpv IPC not ready after 5s")
+        # Cold boot: DRM + PipeWire can push first IPC past 5s; don't continue without it.
+        if mpv_wait_ready(12.0):
+            return True
+        log.warning("mpv IPC not ready after 12s, waiting up to 25s more")
+        if mpv_wait_ready(25.0):
+            return True
+        log.error("mpv IPC never became ready — killing mpv")
+        if mpv_proc[0]:
+            try:
+                mpv_proc[0].terminate()
+                mpv_proc[0].wait(timeout=2)
+            except Exception:
+                try: mpv_proc[0].kill()
+                except Exception: pass
+            mpv_proc[0] = None
+        return False
 
     def kill_mpv():
         try: mpv_quit()
@@ -730,6 +1432,13 @@ def display_controller():
             try: mpv_proc[0].wait(timeout=3)
             except Exception: mpv_proc[0].kill()
             mpv_proc[0] = None
+
+    def ensure_mpv():
+        """Relaunch mpv if it has exited. Used for crash recovery in music-video mode."""
+        if mpv_proc[0] is None or mpv_proc[0].poll() is not None:
+            log.warning("mpv exited unexpectedly — relaunching")
+            if not launch_mpv():
+                log.error("ensure_mpv: relaunch failed")
 
     # ── framebuffer ────────────────────────────────────────────────────────────
     def open_fb():
@@ -761,11 +1470,14 @@ def display_controller():
         if not shutil.which("cava"):
             with _lock: _g["status"] = "cava_unavailable"
             return False
+        # Stock Debian/Raspberry Pi cava often has no pipewire input — use PulseAudio
+        # API (PipeWire provides combined.monitor as a Pulse source).
         conf = (
-            "[general]\nbars = 64\nframerate = 30\n\n"
-            "[input]\nmethod = pipewire\nsource = combined.monitor\n\n"
+            f"[general]\nbars = 64\nframerate = {VIS_CAVA_FRAMERATE}\n\n"
+            "[input]\nmethod = pulse\nsource = combined.monitor\n\n"
             "[output]\nmethod = raw\nraw_target = /dev/stdout\n"
             "data_format = ascii\nascii_max_range = 1000\n"
+            "channels = mono\nmono_option = average\n"
         )
         with open(CAVA_CONF, "w") as f: f.write(conf)
         vis_stop.clear()
@@ -777,9 +1489,11 @@ def display_controller():
             for line in cava_proc[0].stdout:
                 if vis_stop.is_set(): break
                 try:
-                    vals = [int(x) for x in line.strip().split(";") if x.strip()]
-                except Exception: continue
-                if not vals: continue
+                    vals = _parse_cava_ascii_line(line)
+                except Exception:
+                    continue
+                if not vals:
+                    continue
                 with _lock:
                     mirror = _state.get("visualizer_mirror", False)
                     theme  = _state.get("visualizer_theme", "default")
@@ -788,6 +1502,12 @@ def display_controller():
             cava_proc[0].wait()
 
         threading.Thread(target=vis_loop, daemon=True).start()
+        time.sleep(0.08)
+        if cava_proc[0] and cava_proc[0].poll() is not None:
+            log.warning("cava (fullscreen) exited immediately (code %s) — check pulse source (e.g. combined.monitor)",
+                        cava_proc[0].returncode)
+            cava_proc[0] = None
+            return False
         return True
 
     def stop_cava():
@@ -799,93 +1519,260 @@ def display_controller():
             except Exception: pass
             cava_proc[0] = None
 
-    # ── lyrics updater thread ──────────────────────────────────────────────────
-    def _lyrics_updater():
-        """Continuously update lyrics display while in now-playing mode."""
-        while not lyrics_stop.is_set():
-            lyrics_stop.wait(timeout=1.5)
-            if lyrics_stop.is_set():
-                break
-            with _lock:
-                mode    = _state.get("mode", "off")
-                enabled = _state.get("lyrics_enabled", True)
-                overlay = _state.get("overlay_enabled", True)
-            if mode != "now-playing" or not enabled or not overlay:
-                continue
-            # Skip if a crossfade render is in progress
-            if _rendering[0]:
-                continue
+    def stop_np_cava():
+        np_cava_stop.set()
+        p = np_cava_proc[0]
+        np_cava_proc[0] = None
+        np_vis_bars[0] = None
+        if p:
             try:
-                r = subprocess.run(["playerctl", "position"],
-                                   capture_output=True, text=True, timeout=2)
-                pos = float(r.stdout.strip()) if r.returncode == 0 else 0.0
+                p.terminate()
+                p.wait(timeout=2)
             except Exception:
-                continue
-            cur, nxt = get_lyrics_lines(pos)
-            if base_frame[0] is None:
-                continue
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+    def ensure_np_cava():
+        """Pulse/pipewire-monitor cava for now-playing overlay (Pulse API on PipeWire)."""
+        if not shutil.which("cava"):
+            return False
+        if time.monotonic() < np_cava_retry_not_before[0]:
+            return False
+        proc = np_cava_proc[0]
+        if proc and proc.poll() is None:
+            return True
+        stop_np_cava()
+        np_cava_stop.clear()
+        conf = (
+            f"[general]\nbars = 64\nframerate = {NP_CAVA_FRAMERATE}\n\n"
+            "[input]\nmethod = pulse\nsource = combined.monitor\n\n"
+            "[output]\nmethod = raw\nraw_target = /dev/stdout\n"
+            "data_format = ascii\nascii_max_range = 1000\n"
+            "channels = mono\nmono_option = average\n"
+        )
+        try:
+            with open(CAVA_NP_CONF, "w") as f:
+                f.write(conf)
+            np_cava_proc[0] = subprocess.Popen(
+                ["cava", "-p", CAVA_NP_CONF],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except Exception as e:
+            log.warning("now-playing cava start failed: %s", e)
+            np_cava_proc[0] = None
+            np_cava_retry_not_before[0] = time.monotonic() + 4.0
+            return False
+
+        proc_ref = np_cava_proc[0]
+
+        def _np_reader():
             try:
-                # Fast path: composite lyrics text onto cached base frame
-                # Avoids re-running the expensive 4K blur/resize every 1.5s
+                for line in proc_ref.stdout:
+                    if np_cava_stop.is_set():
+                        break
+                    vals = _parse_cava_ascii_line(line)
+                    if vals:
+                        np_vis_bars[0] = vals
+            except Exception:
+                pass
+
+        threading.Thread(target=_np_reader, daemon=True).start()
+        time.sleep(0.08)
+        proc = np_cava_proc[0]
+        if proc and proc.poll() is not None:
+            log.warning("now-playing cava exited immediately (code %s) — check pulse source (pactl list sources short)",
+                        proc.returncode)
+            np_cava_proc[0] = None
+            np_cava_retry_not_before[0] = time.monotonic() + 4.0
+            return False
+        np_cava_retry_not_before[0] = 0.0
+        return True
+
+    # ── now-playing overlay thread (lyrics + optional cava strip) ────────────
+    _LYRIC_ANIM_DUR = 0.48
+    lyric_anim = {"line": "", "outgoing": "", "t0": 0.0}
+
+    def _now_playing_overlay_updater():
+        while not lyrics_stop.is_set():
+            with _lock:
+                mode = _state.get("mode", "off")
+            if mode != "now-playing":
+                stop_np_cava()
+                lyric_anim["line"] = ""
+                lyric_anim["outgoing"] = ""
+                lyrics_stop.wait(timeout=0.5)
+                continue
+
+            with _lock:
+                vis_key = _state.get("now_playing_visualizer", "none")
+                lyrics_on = (
+                    _state.get("lyrics_enabled", True)
+                    and _state.get("overlay_enabled", True)
+                )
+                mirror = _state.get("visualizer_mirror", False)
+                lyrics_anim = bool(_state.get("lyrics_animation", False))
+                debug_on = bool(_state.get("now_playing_debug_overlay", False))
+
+            want_vis = bool(vis_key and vis_key != "none")
+            if want_vis:
+                if not ensure_np_cava():
+                    want_vis = False
+            else:
+                stop_np_cava()
+
+            if not want_vis and not lyrics_on and not debug_on:
+                lyrics_stop.wait(timeout=0.45)
+                continue
+
+            if _rendering[0]:
+                lyrics_stop.wait(timeout=0.1)
+                continue
+
+            if base_frame[0] is None:
+                lyrics_stop.wait(timeout=0.25)
+                continue
+
+            cur, nxt = "", ""
+            elapsed = 0.0
+            if lyrics_on:
+                try:
+                    r = subprocess.run(
+                        ["playerctl", "position"],
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                    )
+                    pos = float(r.stdout.strip()) if r.returncode == 0 else 0.0
+                except Exception:
+                    pos = 0.0
+                cur, nxt = get_lyrics_lines(pos)
+                if lyrics_anim:
+                    if not cur and not nxt:
+                        lyric_anim["line"] = ""
+                        lyric_anim["outgoing"] = ""
+                    elif cur != lyric_anim["line"]:
+                        if lyric_anim["line"]:
+                            lyric_anim["outgoing"] = lyric_anim["line"]
+                        lyric_anim["line"] = cur
+                        lyric_anim["t0"] = time.monotonic()
+                    now = time.monotonic()
+                    elapsed = now - lyric_anim["t0"]
+                    if elapsed >= _LYRIC_ANIM_DUR:
+                        lyric_anim["outgoing"] = ""
+                else:
+                    lyric_anim["line"] = ""
+                    lyric_anim["outgoing"] = ""
+                    elapsed = _LYRIC_ANIM_DUR
+            else:
+                lyric_anim["line"] = ""
+                lyric_anim["outgoing"] = ""
+
+            try:
                 frame = base_frame[0].copy()
-                if cur:
-                    draw = ImageDraw.Draw(frame)
-                    scale = H / 1080
-                    try:
-                        fl  = ImageFont.truetype(FONT_REG, int(32 * scale))
-                        fln = ImageFont.truetype(FONT_REG, int(28 * scale))
-                    except Exception:
-                        fl = fln = ImageFont.load_default()
-                    ly  = int(H * 0.91)
-                    ly2 = int(H * 0.96)
-                    for dx, dy, col in [(1, 1, (0, 0, 0)), (0, 0, (255, 255, 255))]:
-                        draw.text((W//2+dx, ly+dy), cur, font=fl, fill=col, anchor="mm")
-                    if nxt:
-                        draw.text((W//2, ly2), nxt, font=fln, fill=(180, 180, 180), anchor="mm")
+                if want_vis:
+                    composite_now_playing_vis(
+                        frame, W, H, np_vis_bars[0], vis_key, mirror
+                    )
+                if lyrics_on:
+                    composite_lyrics_on_frame(
+                        frame, W, H, cur, nxt,
+                        lyric_anim["outgoing"] if lyrics_anim else "",
+                        elapsed, _LYRIC_ANIM_DUR,
+                        animated=lyrics_anim,
+                    )
+                if debug_on:
+                    composite_np_debug_overlay(frame, _collect_now_playing_debug_lines())
                 save_np_frame(frame)
                 mpv_loadfile(NP_FILE, loop=True)
             except Exception as e:
-                log.debug("lyrics updater render error: %s", e)
+                log.debug("now-playing overlay updater error: %s", e)
+
+            anim_busy = lyrics_anim and (
+                bool(lyric_anim["outgoing"]) or (
+                    lyrics_on and elapsed < _LYRIC_ANIM_DUR and bool(cur)
+                )
+            )
+            _cap = min(NP_CAVA_FRAMERATE, NP_OVERLAY_MAX_HZ)
+            _s_vis = max(1.0 / _cap, 1.0 / 120.0)
+            if want_vis:
+                sleep_t = _s_vis
+            elif anim_busy:
+                sleep_t = max(_s_vis * 0.85, 1.0 / 80.0)
+            elif lyrics_on:
+                sleep_t = max(_s_vis * 3.0, 0.1)
+            elif debug_on:
+                sleep_t = max(0.85, 1.0 / min(NP_OVERLAY_MAX_HZ, 8))
+            else:
+                sleep_t = max(_s_vis * 10.0, 0.22)
+            lyrics_stop.wait(timeout=sleep_t)
 
     # ── mode transitions ───────────────────────────────────────────────────────
-    def teardown(mode):
+    def teardown(mode, next_mode=None):
+        """Stop resources for `mode`. Only switch to the text console when landing on `off`
+        (or shutdown). Avoid chvt to console between two HDMI modes — prevents a flash of
+        login TTY during track/mode transitions."""
+        to_console = next_mode in (None, "off")
         if mode == "now-playing":
             if clock_timer[0]:
                 clock_timer[0].cancel()
                 clock_timer[0] = None
-            # Stop lyrics updater thread
+            stop_np_cava()
+            # Stop now-playing overlay thread
             lyrics_stop.set()
             if lyrics_thread[0] and lyrics_thread[0].is_alive():
                 lyrics_thread[0].join(timeout=3)
             lyrics_thread[0] = None
-            kill_mpv(); chvt(1)
+            kill_mpv()
+            if to_console:
+                chvt(CONSOLE_VT)
         elif mode == "visualizer":
-            stop_cava(); close_fb(); chvt(1)
+            stop_cava(); close_fb()
+            if to_console:
+                chvt(CONSOLE_VT)
         elif mode == "music-video":
-            kill_mpv(); chvt(1)
+            kill_mpv()
+            if to_console:
+                chvt(CONSOLE_VT)
 
     def setup(mode):
         """Returns True on success, False on failure (falls back to off)."""
         log.info("mode → %s", mode)
         if mode == "off":
-            chvt(1)
+            chvt(CONSOLE_VT)
         elif mode == "now-playing":
-            chvt(2); launch_mpv()
+            chvt(BLANK_VT)
+            if not launch_mpv():
+                chvt(CONSOLE_VT)
+                return False
             black = Image.new("RGB", (W, H), (0,0,0))
-            save_np_frame(black); mpv_loadfile(NP_FILE, loop=True)
+            try:
+                save_np_frame(black)
+                mpv_loadfile(NP_FILE, loop=True)
+            except OSError as e:
+                log.error("now-playing: mpv_loadfile failed: %s", e)
+                kill_mpv()
+                chvt(CONSOLE_VT)
+                return False
             old_frame[0] = black
             with _lock: _g["status"] = "idle"
-            # Start lyrics updater thread
+            # Overlay thread (lyrics + optional now-playing cava strip)
             lyrics_stop.clear()
-            lyrics_thread[0] = threading.Thread(target=_lyrics_updater, daemon=True)
+            lyrics_thread[0] = threading.Thread(
+                target=_now_playing_overlay_updater, daemon=True
+            )
             lyrics_thread[0].start()
         elif mode == "visualizer":
-            chvt(2); open_fb()
+            chvt(BLANK_VT); open_fb()
             if not start_cava():
-                close_fb(); chvt(1); return False
+                close_fb(); chvt(CONSOLE_VT); return False
             with _lock: _g["status"] = "idle"
         elif mode == "music-video":
-            chvt(2); launch_mpv(); skip_count[0] = 0
+            chvt(BLANK_VT)
+            if not launch_mpv():
+                chvt(CONSOLE_VT)
+                return False
+            skip_count[0] = 0
             with _lock: _g["status"] = "idle"
         return True
 
@@ -911,10 +1798,15 @@ def display_controller():
             new_frame = render_now_playing(ev.title, ev.artist, ev.artUrl, overlay, W, H,
                                            album=getattr(ev, "album", ""))
             base_frame[0] = new_frame  # cache without lyrics for cheap updater compositing
-            crossfade_to(old_frame[0], new_frame, W, H)
+            if getattr(ev, "force", False) and old_frame[0] is not None:
+                save_np_frame(new_frame)
+                mpv_loadfile(NP_FILE, loop=True)
+            else:
+                crossfade_to(old_frame[0], new_frame, W, H)
             old_frame[0] = new_frame
             with _lock:
-                _track.update(title=ev.title, artist=ev.artist, artUrl=ev.artUrl)
+                _track.update(title=ev.title, artist=ev.artist, artUrl=ev.artUrl,
+                             album=getattr(ev, "album", "") or "")
                 _g["status"] = "playing" if (ev.title or ev.artist) else "idle"
             append_history(ev.title, ev.artist, getattr(ev, "album", ""))
         finally:
@@ -924,12 +1816,14 @@ def display_controller():
     def handle_video(ev):
         log.info("music-video: searching for %r — %r", ev.artist, ev.title)
         with _lock:
-            _track.update(title=ev.title, artist=ev.artist)
+            _track.update(title=ev.title, artist=ev.artist, artUrl=ev.artUrl,
+                         album=getattr(ev, "album", "") or "")
             _g["status"] = "searching"
 
-        # Show cover art while searching
+        # Show cover art while searching; keep fallback for error recovery later
         with _lock:
             overlay = _state.get("overlay_enabled", True)
+        fallback = Image.new("RGB", (W, H), (0, 0, 0))
         try:
             fallback = render_now_playing(ev.title, ev.artist, ev.artUrl, overlay, W, H,
                                           album=getattr(ev, "album", ""))
@@ -938,38 +1832,77 @@ def display_controller():
         except Exception as e:
             log.debug("fallback cover render failed: %s", e)
 
-        url = find_video_url(ev.artist, ev.title)
+        with _lock:
+            skip_threshold   = int(_state.get("video_skip_threshold", 3))
+            no_video_action  = _state.get("video_no_found_action", "skip")
+            search_template  = _state.get("video_search_template",
+                                          "{artist} {title} official music video")
+            max_candidates   = int(_state.get("video_max_candidates", 1))
+            fuzzy_threshold  = float(_state.get("video_fuzzy_threshold", 0.0))
+            search_timeout   = int(_state.get("video_search_timeout", 30))
+            fallback_enabled = bool(_state.get("video_fallback_enabled", False))
+            fallback_tmpl    = _state.get("video_fallback_template", "{artist} {title}")
+            bt_mute_mode     = _state.get("video_bt_mute", "always")
+            must_include     = _state.get("video_must_include", "")
+
+        query = search_template.format(artist=ev.artist, title=ev.title)
+        url = find_video_url(query, max_candidates=max_candidates, timeout=search_timeout,
+                             fuzzy_threshold=fuzzy_threshold,
+                             artist=ev.artist, title=ev.title,
+                             must_include=must_include)
+        if not url and fallback_enabled:
+            fallback_query = fallback_tmpl.format(artist=ev.artist, title=ev.title)
+            log.info("music-video: primary search failed — trying fallback %r", fallback_query)
+            url = find_video_url(fallback_query, max_candidates=max_candidates,
+                                 timeout=search_timeout, fuzzy_threshold=0.0,
+                                 artist=ev.artist, title=ev.title,
+                                 must_include=must_include)
 
         if not url:
             skip_count[0] += 1
-            if skip_count[0] >= 5:
+            log.info("music-video: no video found (%d/%d), action=%s",
+                     skip_count[0], skip_threshold, no_video_action)
+            if no_video_action == "cover_art" or skip_count[0] >= skip_threshold:
                 with _lock:
-                    _state["mode"] = "now-playing"
+                    if no_video_action != "cover_art":
+                        _state["mode"] = "now-playing"
                     _g["status"] = "no_videos_found"
                 save_state(dict(_state))
                 skip_count[0] = 0
-                _queue.put(ModeChangeEvent("now-playing",
-                                           _state.get("overlay_enabled", True),
-                                           _state.get("visualizer_mirror", False)))
+                if no_video_action != "cover_art":
+                    _queue.put(ModeChangeEvent("now-playing",
+                                               _state.get("overlay_enabled", True),
+                                               _state.get("visualizer_mirror", False)))
+                # else: stay in music-video mode showing cover art, wait for next track
             else:
                 subprocess.run(["playerctl", "next"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
 
         skip_count[0] = 0
-        subprocess.run(["playerctl", "pause"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if bt_mute_mode == "always":
+            bt_mute(True)
         with _lock: _g["status"] = "playing"
-        mpv_loadfile(url)
+        ensure_mpv()
+        try:
+            mpv_loadfile(url)
+        except Exception as e:
+            log.warning("music-video: mpv_loadfile failed (%s) — showing cover art", e)
+            ensure_mpv()
+            save_np_frame(fallback)
+            mpv_loadfile(NP_FILE, loop=True)
+            if bt_mute_mode == "always":
+                bt_mute(False)
+            return
 
-        # Drain StatusEvents accumulated during search (e.g. from playerctl pause)
+        # Drain StatusEvents accumulated during search
         # Only abort if a real skip (MetadataEvent/ModeChangeEvent) arrived
         _stale_buf = []
         while True:
             try:
                 _item = _queue.get_nowait()
                 if isinstance(_item, StatusEvent):
-                    pass  # discard stale pause/stop events
+                    pass  # discard stale events
                 else:
                     _stale_buf.append(_item)
             except queue.Empty:
@@ -978,24 +1911,45 @@ def display_controller():
             for _item in _stale_buf:
                 _queue.put(_item)
             mpv_stop()
+            if bt_mute_mode == "always":
+                bt_mute(False)
             return  # real track change / mode change arrived while searching
 
         ended_normally = mpv_wait_end_file()
+        if bt_mute_mode == "always":
+            bt_mute(False)
         if ended_normally:
-            subprocess.run(["playerctl", "next"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # wait up to 5s for metadata; if none arrives, call play to resume queue
-            deadline = time.time() + 5.0
-            got_event = False
-            while time.time() < deadline:
-                if not _queue.empty():
-                    got_event = True; break
-                time.sleep(0.2)
-            if not got_event:
-                subprocess.run(["playerctl", "play"],
+            with _lock:
+                after_ends = _state.get("video_after_ends", "next")
+            if after_ends == "loop":
+                log.info("music-video: looping video")
+                try:
+                    mpv_loadfile(url)
+                except Exception:
+                    pass
+            elif after_ends == "cover_art":
+                log.info("music-video: video ended — showing cover art")
+                save_np_frame(fallback)
+                mpv_loadfile(NP_FILE)
+            else:  # "next"
+                subprocess.run(["playerctl", "next"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # wait up to 5s for metadata; if none arrives, call play to resume queue
+                deadline = time.time() + 5.0
+                got_event = False
+                while time.time() < deadline:
+                    if not _queue.empty():
+                        got_event = True; break
+                    time.sleep(0.2)
+                if not got_event:
+                    subprocess.run(["playerctl", "play"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            mpv_stop()
+            # mpv error or crash — show cover art, let BT audio resume
+            log.warning("music-video: mpv ended with error/crash for %r — recovering", url)
+            ensure_mpv()
+            save_np_frame(fallback)
+            mpv_loadfile(NP_FILE, loop=True)
 
     # ── main event loop ────────────────────────────────────────────────────────
     while True:
@@ -1005,22 +1959,32 @@ def display_controller():
             continue
 
         if ev is None:
-            teardown(current_mode)
+            teardown(current_mode, None)
             return
 
         if isinstance(ev, ModeChangeEvent):
             new_mode = ev.mode
             mode_changed = new_mode != current_mode
             if mode_changed:
-                teardown(current_mode)
-                ok = setup(new_mode)
+                teardown(current_mode, new_mode)
+                ok = True
+                try:
+                    ok = setup(new_mode)
+                except Exception:
+                    log.exception("display setup failed for mode %s", new_mode)
+                    ok = False
+                if not ok:
+                    teardown(new_mode, "off")
                 current_mode = new_mode if ok else "off"
+            with _lock:
+                _g["current_mode"] = current_mode
             # Re-render now-playing only when mode actually changed OR when the track
             # has not been rendered yet (base_frame is None). Skipping the re-render
             # when mode is unchanged avoids a redundant ~15s crossfade on Pi4.
             if current_mode == "now-playing" and (mode_changed or base_frame[0] is None):
                 with _lock:
-                    t = MetadataEvent(_track["title"], _track["artist"], _track["artUrl"])
+                    t = MetadataEvent(_track["title"], _track["artist"], _track["artUrl"],
+                                      album=_track.get("album", "") or "")
                 do_render(t)
 
         elif isinstance(ev, StatusEvent):
@@ -1047,9 +2011,20 @@ def display_controller():
             if ev.status in ("Stopped", ""):
                 with _lock: _g["status"] = "idle"
                 if current_mode == "now-playing":
-                    black = Image.new("RGB", (W, H), (0,0,0))
-                    save_np_frame(black); mpv_loadfile(NP_FILE, loop=True)
-                    old_frame[0] = black
+                    skip_black = False
+                    with _lock:
+                        if _state.get("audio_mode", True) and (
+                            _track.get("title") or _track.get("artist")
+                        ):
+                            skip_black = True
+                    if skip_black:
+                        log.debug(
+                            "audio_mode: keep last frame (no black) on transient Stopped/empty"
+                        )
+                    else:
+                        black = Image.new("RGB", (W, H), (0,0,0))
+                        save_np_frame(black); mpv_loadfile(NP_FILE, loop=True)
+                        old_frame[0] = black
             elif ev.status not in ("Paused",):
                 with _lock:
                     if _g["status"] not in ("searching", "no_videos_found",
@@ -1060,16 +2035,61 @@ def display_controller():
 
         elif isinstance(ev, MetadataEvent):
             changed = (ev.title != _track["title"] or ev.artist != _track["artist"]
-                       or ev.artUrl != _track["artUrl"])
+                       or ev.artUrl != _track["artUrl"]
+                       or (getattr(ev, "album", "") or "") != (_track.get("album") or ""))
             if current_mode == "now-playing":
-                if changed:
+                if changed or ev.force:
                     do_render(ev)
             elif current_mode == "music-video":
                 if ev.title != _track["title"] or ev.artist != _track["artist"]:
                     handle_video(ev)
             else:
                 with _lock:
-                    _track.update(title=ev.title, artist=ev.artist)
+                    _track.update(title=ev.title, artist=ev.artist, artUrl=ev.artUrl,
+                                 album=getattr(ev, "album", "") or "")
+
+
+# ── mpv state query (for /state HTTP endpoint) ────────────────────────────────
+def _query_mpv_state():
+    """Non-blocking mpv IPC query. Returns dict or None if mpv not running."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        s.connect(MPV_SOCK)
+        props = ["video-codec", "width", "height", "container-fps",
+                 "pause", "time-pos", "duration", "filename"]
+        for p in props:
+            s.sendall((json.dumps({"command": ["get_property", p]}) + "\n").encode())
+        time.sleep(0.15)
+        data = b""
+        try:
+            while True:
+                chunk = s.recv(16384)
+                if not chunk: break
+                data += chunk
+        except Exception: pass
+        s.close()
+        results = []
+        for line in data.split(b"\n"):
+            line = line.strip()
+            if line:
+                try:
+                    obj = json.loads(line)
+                    if "request_id" in obj:
+                        results.append(obj)
+                except Exception: pass
+        info = {}
+        for p, r in zip(props, results):
+            if r.get("error") == "success":
+                key = p.replace("-", "_")
+                val = r["data"]
+                # truncate long URLs for display
+                if key == "filename" and val and len(val) > 80:
+                    val = val[:80] + "…"
+                info[key] = val
+        return info if info else None
+    except Exception:
+        return None
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -1090,7 +2110,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/state":
             with _lock:
                 data = {**_state, "track": dict(_track), "status": _g["status"]}
+            data["mpv"] = _query_mpv_state()
             self.send_json(200, data)
+        elif self.path == "/log":
+            try:
+                with open("/tmp/pi8-audio.log", "r", errors="replace") as f:
+                    lines = f.readlines()
+                tail = "".join(lines[-80:])
+            except Exception:
+                tail = "(log unavailable)"
+            body = tail.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         elif self.path == "/history":
             try:
                 lines = HISTORY_FILE.read_text().splitlines() if HISTORY_FILE.exists() else []
@@ -1102,7 +2138,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 data = open(NP_FILE, "rb").read()
                 self.send_response(200)
-                self.send_header("Content-Type", "image/png")
+                ct = "image/jpeg" if NP_FILE.endswith(".jpg") else "image/png"
+                self.send_header("Content-Type", ct)
                 self.send_header("Content-Length", len(data))
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
@@ -1134,6 +2171,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     artist=body.get("artist", ""),
                     artUrl=body.get("artUrl", ""),
                     album=body.get("album", ""),
+                    force=bool(body.get("force", False)),
                 )
                 _queue.put(ev)
                 self.send_json(200, {"ok": True, "event": "MetadataEvent"})
@@ -1153,20 +2191,118 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length) or b"{}")
         except Exception:
             self.send_json(400, {"error": "bad JSON"}); return
+        cover_touched = bool(body) and any(
+            str(k).startswith("cover_art_") for k in body)
         if "mode" in body and body["mode"] not in {"off","now-playing","visualizer","music-video"}:
             self.send_json(400, {"error": "invalid mode"}); return
+        if "now_playing_visualizer" in body:
+            v = body["now_playing_visualizer"]
+            if v != "none" and v not in _VIS_THEMES:
+                self.send_json(400, {"error": "invalid now_playing_visualizer"})
+                return
         with _lock:
             for k in ("mode", "overlay_enabled", "visualizer_mirror"):
                 if k in body: _state[k] = body[k]
             if "visualizer_theme" in body and body["visualizer_theme"] in _VIS_THEMES:
                 _state["visualizer_theme"] = body["visualizer_theme"]
+            if "now_playing_visualizer" in body:
+                _state["now_playing_visualizer"] = body["now_playing_visualizer"]
             if "lyrics_enabled" in body:
                 _state["lyrics_enabled"] = bool(body["lyrics_enabled"])
-            ev = ModeChangeEvent(_state["mode"], _state["overlay_enabled"],
-                                 _state["visualizer_mirror"])
+            if "lyrics_animation" in body:
+                _state["lyrics_animation"] = bool(body["lyrics_animation"])
+            if "now_playing_debug_overlay" in body:
+                _state["now_playing_debug_overlay"] = bool(
+                    body["now_playing_debug_overlay"])
+            if "audio_mode" in body:
+                _state["audio_mode"] = bool(body["audio_mode"])
+            if "lyrics_avsync_lag_sec" in body:
+                _state["lyrics_avsync_lag_sec"] = max(
+                    -0.5, min(1.5, float(body["lyrics_avsync_lag_sec"]))
+                )
+            if "video_skip_threshold" in body:
+                _state["video_skip_threshold"] = max(1, int(body["video_skip_threshold"]))
+            if "video_no_found_action" in body and body["video_no_found_action"] in ("skip", "cover_art"):
+                _state["video_no_found_action"] = body["video_no_found_action"]
+            if "video_search_template" in body and body["video_search_template"].strip():
+                _state["video_search_template"] = body["video_search_template"].strip()
+            if "video_max_resolution" in body and body["video_max_resolution"] in _RESOLUTION_FMT:
+                _state["video_max_resolution"] = body["video_max_resolution"]
+                _apply_resolution_to_mpv(body["video_max_resolution"])
+            if "video_fuzzy_threshold" in body:
+                _state["video_fuzzy_threshold"] = max(0.0, min(1.0, float(body["video_fuzzy_threshold"])))
+            if "video_max_candidates" in body and int(body["video_max_candidates"]) in (1, 3, 5):
+                _state["video_max_candidates"] = int(body["video_max_candidates"])
+            if "video_search_timeout" in body:
+                _state["video_search_timeout"] = max(5, min(120, int(body["video_search_timeout"])))
+            if "video_fallback_enabled" in body:
+                _state["video_fallback_enabled"] = bool(body["video_fallback_enabled"])
+            if "video_fallback_template" in body and body["video_fallback_template"].strip():
+                _state["video_fallback_template"] = body["video_fallback_template"].strip()
+            if "video_after_ends" in body and body["video_after_ends"] in ("next", "loop", "cover_art"):
+                _state["video_after_ends"] = body["video_after_ends"]
+            if "video_bt_mute" in body and body["video_bt_mute"] in ("always", "never"):
+                _state["video_bt_mute"] = body["video_bt_mute"]
+            if "video_must_include" in body:
+                _state["video_must_include"] = body["video_must_include"].strip()
+            if "cover_art_online_enabled" in body:
+                _state["cover_art_online_enabled"] = bool(body["cover_art_online_enabled"])
+            if "cover_art_ignore_mpris" in body:
+                _state["cover_art_ignore_mpris"] = bool(body["cover_art_ignore_mpris"])
+            if "cover_art_providers" in body:
+                raw = body["cover_art_providers"]
+                if isinstance(raw, str):
+                    raw = [x.strip().lower() for x in raw.split(",") if x.strip()]
+                if isinstance(raw, list):
+                    seen = []
+                    for p in raw:
+                        p = str(p).strip().lower()
+                        if p in _COVER_PROVIDERS and p not in seen:
+                            seen.append(p)
+                    _state["cover_art_providers"] = seen
+            if "cover_art_search_template" in body:
+                t = str(body["cover_art_search_template"] or "").strip()
+                if t:
+                    _state["cover_art_search_template"] = t[:400]
+            if "cover_art_soundcloud_client_id" in body:
+                sid = str(body["cover_art_soundcloud_client_id"] or "").strip()
+                _state["cover_art_soundcloud_client_id"] = sid
+                try:
+                    cfg = {**load_display_config(), "soundcloud_client_id": sid}
+                    tpath = DISPLAY_CONFIG_FILE.with_suffix(".tmp")
+                    tpath.write_text(json.dumps(cfg, indent=2))
+                    tpath.rename(DISPLAY_CONFIG_FILE)
+                    _display_config.clear()
+                    _display_config.update(cfg)
+                except Exception as e:
+                    log.debug("persist soundcloud client id: %s", e)
+            if "cover_art_itunes_country" in body:
+                c = str(body["cover_art_itunes_country"] or "us").strip().lower()
+                _state["cover_art_itunes_country"] = c[:8] if c else "us"
+            if "cover_art_per_provider_limit" in body:
+                _state["cover_art_per_provider_limit"] = max(
+                    1, min(15, int(body["cover_art_per_provider_limit"])))
+            if "cover_art_pick_index" in body:
+                _state["cover_art_pick_index"] = max(
+                    0, min(9, int(body["cover_art_pick_index"])))
+            if ("cover_art_ranking" in body
+                    and body["cover_art_ranking"] in ("api_order", "best_match")):
+                _state["cover_art_ranking"] = body["cover_art_ranking"]
+            cm = _g.get("current_mode", "off")
+            need_mode_transition = "mode" in body and body["mode"] != cm
+            is_np = cm == "now-playing"
+            track_snap = dict(_track)
             state_snapshot = dict(_state)
+        if cover_touched:
+            _art_cache.clear()
         save_state(state_snapshot)
-        _queue.put(ev)
+        if need_mode_transition:
+            _queue.put(ModeChangeEvent(_state["mode"], _state["overlay_enabled"],
+                                       _state["visualizer_mirror"]))
+        elif body and is_np and ("overlay_enabled" in body or cover_touched):
+            alb = track_snap.get("album", "") or ""
+            _queue.put(MetadataEvent(track_snap["title"], track_snap["artist"],
+                                     track_snap["artUrl"], alb, force=True))
         self.send_json(200, {"ok": True})
 
 
@@ -1194,15 +2330,22 @@ def bt_connect_watcher():
                     save_state(state_snap)
                     _queue.put(ev)
                 elif not now_present and mode == "now-playing":
-                    log.info("BT player disconnected — auto-switching to off")
                     with _lock:
-                        _state["mode"] = "off"
-                        ev = ModeChangeEvent("off",
-                                             _state.get("overlay_enabled", True),
-                                             _state.get("visualizer_mirror", False))
-                        state_snap = dict(_state)
-                    save_state(state_snap)
-                    _queue.put(ev)
+                        keep_hdmi = bool(_state.get("audio_mode", True))
+                    if keep_hdmi:
+                        log.debug(
+                            "playerctl unavailable — audio_mode: stay on now-playing (no TTY)"
+                        )
+                    else:
+                        log.info("BT player disconnected — auto-switching to off")
+                        with _lock:
+                            _state["mode"] = "off"
+                            ev = ModeChangeEvent("off",
+                                                 _state.get("overlay_enabled", True),
+                                                 _state.get("visualizer_mirror", False))
+                            state_snap = dict(_state)
+                        save_state(state_snap)
+                        _queue.put(ev)
         except Exception as e:
             log.debug("bt_connect_watcher error: %s", e)
         time.sleep(5)
@@ -1214,14 +2357,31 @@ if __name__ == "__main__":
     os.makedirs(CF_DIR, exist_ok=True)
     saved = load_state()
     with _lock:
-        for k in ("mode", "overlay_enabled", "visualizer_mirror", "lyrics_enabled"):
+        for k in ("mode", "overlay_enabled", "visualizer_mirror", "lyrics_enabled",
+                  "lyrics_animation", "now_playing_visualizer",
+                  "now_playing_debug_overlay", "audio_mode", "lyrics_avsync_lag_sec",
+                  "video_skip_threshold", "video_no_found_action", "video_search_template",
+                  "video_max_resolution", "video_fuzzy_threshold", "video_max_candidates",
+                  "video_search_timeout", "video_fallback_enabled", "video_fallback_template",
+                  "video_after_ends", "video_bt_mute", "video_must_include",
+                  "cover_art_online_enabled", "cover_art_ignore_mpris", "cover_art_providers",
+                  "cover_art_search_template", "cover_art_soundcloud_client_id",
+                  "cover_art_itunes_country", "cover_art_per_provider_limit",
+                  "cover_art_pick_index", "cover_art_ranking"):
             if k in saved: _state[k] = saved[k]
+        if not (_state.get("cover_art_soundcloud_client_id") or "").strip():
+            sid = (_display_config.get("soundcloud_client_id") or "").strip()
+            if sid:
+                _state["cover_art_soundcloud_client_id"] = sid
 
+    # Kill any orphaned mpv from a previous (unclean) shutdown
+    subprocess.run(["pkill", "-f", "mpv.*--vo=drm"], stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
     try: os.unlink(MPV_SOCK)
     except FileNotFoundError: pass
 
     for fn in (mpris_metadata_watcher, mpris_status_watcher, display_controller,
-               bt_connect_watcher):
+               bt_connect_watcher, _audio_health_watcher):
         threading.Thread(target=fn, daemon=True).start()
 
     # fire initial mode setup after controller thread starts
@@ -1236,6 +2396,10 @@ if __name__ == "__main__":
     def _shutdown(signum, frame):
         log.info("shutdown signal %d — tearing down", signum)
         _queue.put(None)
+        # Kill mpv immediately so DRM is freed for the next launch
+        subprocess.run(["pkill", "-f", "mpv.*--vo=drm"], stderr=subprocess.DEVNULL)
+        # Return to TTY regardless of whether controller thread finishes cleanly
+        subprocess.run(["sudo", "/usr/bin/chvt", str(CONSOLE_VT)], stderr=subprocess.DEVNULL)
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
