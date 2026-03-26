@@ -37,11 +37,16 @@ sudo usermod -aG video liu
 
 ### sudoers (VT switching)
 
+The daemon switches to a **blank VT** for HDMI (`PI8_BLANK_VT`, default **2**) and back to the **console VT** where autologin runs (`PI8_CONSOLE_VT`, default **1**). If your login session is not on VT1, set the env vars on the **`display-daemon`** service (or shell) and grant `chvt` for those numbers.
+
 ```bash
 echo 'liu ALL=(ALL) NOPASSWD: /usr/bin/chvt 1, /usr/bin/chvt 2' \
   | sudo tee /etc/sudoers.d/liu-display
 sudo chmod 440 /etc/sudoers.d/liu-display
+# If using e.g. PI8_CONSOLE_VT=7 PI8_BLANK_VT=8, add: /usr/bin/chvt 7, /usr/bin/chvt 8
 ```
+
+**4K / smooth motion (optional env on `display-daemon`):** `PI8_VIS_FRAMERATE` (default 72, fullscreen cava), `PI8_NP_CAVA_FRAMERATE` (default 90, cover spectrum input), `PI8_NP_OVERLAY_MAX_HZ` (default 48, caps JPEG+mpv pushes — raise on a fast board, lower if the Pi pegs CPU), `PI8_NP_JPEG_QUALITY` (default 92).
 
 ### Install
 
@@ -58,7 +63,15 @@ Bluetooth visibility depends on **`bt-speaker`**: it runs `discoverable on` / `p
 
 The adapter **friendly name** comes from BlueZ’s hostname plugin (`PRETTY_HOSTNAME` in **`/etc/machine-info`**) and a persisted **alias** under **`/var/lib/bluetooth/<adapter>/settings`**. `bt-speaker-init.sh` sets **`bluetoothctl system-alias`** to the **static hostname** (`hostnamectl --static`) so the radio name stays **`pi8`** (or whatever `/etc/hostname` is) and does not stick on an old value.
 
-**D-Bus / A2DP:** If the phone sees **pi8** but **cannot connect**, check `journalctl` for `Rejected send message ... MediaEndpoint1.Error.NotImplemented` (WirePlumber vs `bluetoothd`). Ubuntu’s default bus policy only allows those replies when `send_requested_reply=true`; PipeWire often sends `requested_reply=0`. Install **`config/dbus-zz-pi8-bluetooth-wireplumber-policy.conf`** as **`/etc/dbus-1/system.d/zz-pi8-bluetooth-wireplumber-policy.conf`** and run **`sudo systemctl reload dbus`**, then restart **`bluetooth`** and user **`pipewire`** / **`wireplumber`**. **`deploy.sh`** does this for you (uses `sudo`).
+**D-Bus / A2DP:** If the phone sees **pi8** but **cannot connect**, check `journalctl -u dbus` for `Rejected send message ... MediaEndpoint1.Error.NotImplemented` (WirePlumber → `bluetoothd`). Stock system policy only allows `error` / `method_return` when `send_requested_reply=true`; BlueZ negotiation uses `requested_reply=0`, and those messages have `interface="(unset)"`, so **`send_interface` rules do not apply**—the policy must include `<allow send_type="error"/>` and `<allow send_type="method_return"/>`. **`deploy.sh`** installs **`config/dbus-zz-pi8-bluetooth-wireplumber-policy.conf`**, reloads D-Bus, restarts **`bluetooth`**, and restarts user **`pipewire`** / **`wireplumber`** so endpoints re-register. If problems persist after deploy, reboot once or run `sudo systemctl restart dbus` (brief disruption) and restart **`bluetooth`** again.
+
+### Bluetooth: range, RF, and “invisible until I’m close”
+
+The onboard Pi adapter uses **2.4 GHz**. **Distance and noise** matter more than many BlueZ settings. If **pi8** does not show up or will not connect from across the room but **works when the phone is close** (~1 m, line of sight), treat it as **RF first**: move the phone closer for pairing/reconnect, try another board orientation or case (metal lids hurt), and know that **USB3** storage and cables can raise the noise floor—**short/shielded USB3 cables** or **ferrite clamps** on the cable can help if you cannot unplug the drive.
+
+**CLI (no web UI cache issues):** `pi8-audioctl status` — full stack snapshot; `pi8-audioctl restart-bt` after changing BlueZ.
+
+**HCI capture:** `sudo btmon` may **crash** on some **Cypress** controllers (known BlueZ `btmon` bug around Index Info). Use **`sudo hcidump -i hci0 -X`** instead. An empty capture during a phone scan can mean no traffic reached the controller—combine with proximity tests above.
 
 ### SoundCloud cover art (optional)
 
@@ -80,3 +93,5 @@ systemctl --user restart display-daemon
 ## Web UI
 
 Open `http://pi8:8083` — on mobile: tab bar (🎵 Audio / 🖥 Display); on desktop (≥900px): two-column layout.
+
+**Minimal phone page:** `http://pi8:8083/m` — display mode only + **scenes** (no volume or calibration). **Scenes** live in `~/.config/pi8-presets.json` (display + audio bundle). Manage them on the Pi with **`pi8-audio-tui`** (↑↓ Enter apply, `n`/`d`/`[`/`]`, `e` opens `$EDITOR`, `a` toggles `audio_profile` simple↔multi via the API). **`audio_profile`:** `simple` = Bluetooth (and default sink) to HDMI without PipeWire `combine-stream`; `multi` = previous multi-output + combined sink behavior. Legacy **audio presets** in the full UI still use the nested `presets` object inside `~/.config/audio-sync.json` (unrelated to scene file).

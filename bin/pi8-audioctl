@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""
+Pi8 audio / Bluetooth stack — CLI for debugging without the web UI (avoids browser cache issues).
+
+Examples:
+  pi8-audioctl status
+  pi8-audioctl bluetooth-adapter           # show usb | onboard
+  pi8-audioctl bluetooth-adapter usb        # dongle when present (default)
+  pi8-audioctl bluetooth-adapter onboard   # built-in BT only
+  pi8-audioctl restart-bt
+  pi8-audioctl reapply-bt
+  pi8-audioctl logs bt
+  pi8-audioctl logs --follow bt-speaker
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+PI8_BT_ADAPTER_CONF = "/etc/pi8-audio/bluetooth-adapter"
+PI8_SYNC_WEB = os.environ.get("PI8_AUDIO_SYNC_URL", "http://127.0.0.1:8083").rstrip("/")
+
+
+def _import_pi8_presets():
+    b = os.path.expanduser("~/bin")
+    if b not in sys.path:
+        sys.path.insert(0, b)
+    import pi8_presets  # type: ignore
+
+    return pi8_presets
+
+
+def cmd_scene_list(_: argparse.Namespace) -> int:
+    try:
+        pi8_presets = _import_pi8_presets()
+    except ImportError:
+        print("pi8_presets.py not found in ~/bin (run deploy.sh)", file=sys.stderr)
+        return 1
+    store = pi8_presets.load_store()
+    err = pi8_presets.validate_scene_store(store)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    for s in pi8_presets.list_scene_summaries(store):
+        print(f"{s['name']}\t{s['label']}")
+    return 0
+
+
+def cmd_scene_apply(ns: argparse.Namespace) -> int:
+    name = ns.name.strip()
+    if not name:
+        print("name required", file=sys.stderr)
+        return 2
+    req = urllib.request.Request(
+        f"{PI8_SYNC_WEB}/scene/apply",
+        data=json.dumps({"name": name}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            body = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            body = {"msg": str(e)}
+        print(json.dumps(body, indent=2))
+        return 1 if e.code >= 400 else 0
+    except OSError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(json.dumps(body, indent=2))
+    return 0 if body.get("ok", True) else 1
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, **kw)
+
+
+def section(title: str) -> None:
+    print()
+    print(f"── {title} ──")
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    section("systemd (system)")
+    for u in ("bluetooth", "NetworkManager"):
+        r = run(["systemctl", "is-active", u])
+        print(f"  {u}: {r.stdout.strip() or r.stderr.strip() or '?'}")
+
+    section("systemd (user)")
+    for u in (
+        "pipewire",
+        "pipewire-pulse",
+        "wireplumber",
+        "bt-speaker",
+        "audio-sync-web",
+        "dlna-renderer",
+    ):
+        r = run(["systemctl", "--user", "is-active", u])
+        print(f"  {u}: {r.stdout.strip() or r.stderr.strip() or '?'}")
+
+    section("rfkill / Wi‑Fi radio")
+    if shutil.which("rfkill"):
+        r = run(["rfkill", "list"])
+        print(r.stdout or "(no output)")
+    else:
+        print("  (rfkill not installed)")
+    r = run(["nmcli", "-t", "-f", "WIFI", "general"])
+    if r.returncode == 0:
+        print(f"  nmcli WIFI: {r.stdout.strip()}")
+
+    section("Bluetooth adapter policy (/etc/pi8-audio/bluetooth-adapter)")
+    try:
+        with open(PI8_BT_ADAPTER_CONF, "r", encoding="ascii", errors="replace") as f:
+            pol = f.read().strip().splitlines()
+            pol0 = (pol[0] if pol else "").strip().lower()
+            if pol0 not in ("usb", "onboard"):
+                pol0 = pol0 or "(invalid)"
+        print(f"  mode: {pol0}")
+    except FileNotFoundError:
+        print("  mode: (file missing — default usb after deploy)")
+    except PermissionError:
+        print("  mode: (not readable; try sudo cat)", PI8_BT_ADAPTER_CONF)
+
+    section("HCI / adapter")
+    if shutil.which("hciconfig"):
+        r = run(["hciconfig", "-a"])
+        out = (r.stdout or r.stderr or "").strip()
+        print(out[:6000] if len(out) > 6000 else out or "(no output)")
+    else:
+        print("  (hciconfig not found; install bluez package)")
+    if shutil.which("btmgmt"):
+        r = run(["btmgmt", "info"])
+        print(r.stdout or r.stderr)
+
+    section("bluetoothctl show")
+    r = run(["bluetoothctl", "show"])
+    print(r.stdout or r.stderr)
+
+    section("default audio sink (PipeWire)")
+    if shutil.which("wpctl"):
+        r = run(["wpctl", "status"])
+        out = r.stdout or r.stderr
+        print(out[:4000] if len(out) > 4000 else out)
+    else:
+        print("  (wpctl not found)")
+    return 0
+
+
+def cmd_restart_bt(_: argparse.Namespace) -> int:
+    print("Restarting bluetooth.service (needs sudo)…")
+    r = subprocess.run(["sudo", "systemctl", "restart", "bluetooth"])
+    if r.returncode != 0:
+        print("sudo systemctl restart bluetooth failed.", file=sys.stderr)
+        return r.returncode
+    import time
+
+    time.sleep(1.5)
+    print("Restarting user bt-speaker…")
+    subprocess.run(["systemctl", "--user", "restart", "bt-speaker"], check=False)
+    print("Done. Run: pi8-audioctl status")
+    return 0
+
+
+def cmd_bluetooth_adapter(ns: argparse.Namespace) -> int:
+    choice = (ns.choice or "show").strip().lower()
+    if choice == "show":
+        try:
+            with open(PI8_BT_ADAPTER_CONF, "r", encoding="ascii", errors="replace") as f:
+                line = f.read().strip().splitlines()
+                val = (line[0] if line else "").strip().lower()
+        except FileNotFoundError:
+            print("usb")
+            return 0
+        except PermissionError:
+            r = run(["sudo", "cat", PI8_BT_ADAPTER_CONF])
+            print((r.stdout or r.stderr or "?").strip())
+            return 0 if r.returncode == 0 else r.returncode
+        print(val if val in ("usb", "onboard") else val)
+        return 0
+
+    if choice not in ("usb", "onboard"):
+        print("choice must be usb, onboard, or show", file=sys.stderr)
+        return 2
+
+    print(f"Writing {choice} → {PI8_BT_ADAPTER_CONF} (needs sudo)…")
+    r = subprocess.run(["sudo", "mkdir", "-p", "/etc/pi8-audio"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr or r.stdout or "mkdir failed", file=sys.stderr)
+        return r.returncode
+    w = subprocess.run(
+        ["sudo", "tee", PI8_BT_ADAPTER_CONF],
+        input=choice + "\n",
+        text=True,
+        capture_output=True,
+    )
+    if w.returncode != 0:
+        print((w.stderr or w.stdout or "tee failed").strip(), file=sys.stderr)
+        return w.returncode
+    subprocess.run(["sudo", "chmod", "644", PI8_BT_ADAPTER_CONF], capture_output=True)
+    print("Restarting bluetooth.service + user stack…")
+    r = subprocess.run(["sudo", "systemctl", "restart", "bluetooth"])
+    if r.returncode != 0:
+        print("sudo systemctl restart bluetooth failed", file=sys.stderr)
+        return r.returncode
+    import time
+
+    time.sleep(1.5)
+    subprocess.run(["systemctl", "--user", "restart", "bt-speaker"], check=False)
+    subprocess.run(
+        ["systemctl", "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber"],
+        check=False,
+    )
+    print("Done. Run: pi8-audioctl status")
+    return 0
+
+
+def cmd_reapply_bt(_: argparse.Namespace) -> int:
+    home = os.path.expanduser("~")
+    init_sh = os.path.join(home, "bin", "bt-speaker-init.sh")
+    if not os.path.isfile(init_sh):
+        print(f"Missing {init_sh}", file=sys.stderr)
+        return 1
+    print(f"Running {init_sh}…")
+    r = subprocess.run(["bash", init_sh])
+    return r.returncode
+
+
+def _journal_cmd(which: str, lines: int, since: str | None, follow: bool) -> list[str] | None:
+    base = ["journalctl", "--no-pager", "-n", str(lines)]
+    if since:
+        base.extend(["--since", since])
+    if follow:
+        base.append("-f")
+
+    if which == "bt":
+        return base + ["-u", "bluetooth"]
+    if which == "bt-speaker":
+        return base + ["--user", "-u", "bt-speaker"]
+    if which == "pw":
+        return base + ["--user", "-u", "pipewire", "-u", "pipewire-pulse", "-u", "wireplumber"]
+    if which == "dbus":
+        return base + ["-u", "dbus"]
+    if which == "web":
+        return base + ["--user", "-u", "audio-sync-web"]
+    return None
+
+
+def cmd_logs(ns: argparse.Namespace) -> int:
+    which = ns.target
+    since = ns.since
+    follow = ns.follow
+    lines = ns.lines
+
+    if which == "all":
+        if follow:
+            print("Use a single target with -f (e.g. pi8-audioctl logs -f bt).", file=sys.stderr)
+            return 2
+        for label, part in (
+            ("bluetooth.service", "bt"),
+            ("bt-speaker (user)", "bt-speaker"),
+            ("pipewire stack (user)", "pw"),
+        ):
+            section(label)
+            cmd = _journal_cmd(part, lines, since, False)
+            assert cmd is not None
+            subprocess.run(cmd, check=False)
+        return 0
+
+    cmd = _journal_cmd(which, lines, since, follow)
+    if cmd is None:
+        print(f"unknown log target: {which}", file=sys.stderr)
+        return 2
+    return subprocess.run(cmd).returncode
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="pi8-audioctl",
+        description="Debug Pi8 audio/Bluetooth stack from the shell (no web UI).",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", help="Print adapter, services, and wpctl status")
+    p_status.set_defaults(func=cmd_status)
+
+    p_rb = sub.add_parser(
+        "restart-bt",
+        help="sudo systemctl restart bluetooth; then restart user bt-speaker (same as Web UI)",
+    )
+    p_rb.set_defaults(func=cmd_restart_bt)
+
+    p_ra = sub.add_parser(
+        "reapply-bt",
+        help="Run ~/bin/bt-speaker-init.sh only (power on, discoverable, pairable, alias)",
+    )
+    p_ra.set_defaults(func=cmd_reapply_bt)
+
+    p_bta = sub.add_parser(
+        "bluetooth-adapter",
+        help="Show or set Bluetooth radio: usb (dongle when plugged) vs onboard (built-in only)",
+    )
+    p_bta.add_argument(
+        "choice",
+        nargs="?",
+        default="show",
+        choices=("show", "usb", "onboard"),
+        help="show (default) | usb | onboard — set writes sudo + restarts bluetooth stack",
+    )
+    p_bta.set_defaults(func=cmd_bluetooth_adapter)
+
+    p_log = sub.add_parser("logs", help="Show recent journal logs for a component")
+    p_log.add_argument(
+        "target",
+        choices=("bt", "bt-speaker", "pw", "dbus", "web", "all"),
+        help="Which logs to show",
+    )
+    p_log.add_argument(
+        "-n",
+        "--lines",
+        type=int,
+        default=60,
+        metavar="N",
+        help="Lines of history (default 60)",
+    )
+    p_log.add_argument(
+        "--since",
+        metavar="SPEC",
+        help="journalctl --since (e.g. 10m, today, '2026-03-25 12:00')",
+    )
+    p_log.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Follow log (journalctl -f)",
+    )
+    p_log.set_defaults(func=cmd_logs)
+
+    p_sl = sub.add_parser(
+        "scene-list",
+        help="List scene presets from ~/.config/pi8-presets.json",
+    )
+    p_sl.set_defaults(func=cmd_scene_list)
+
+    p_sa = sub.add_parser(
+        "scene-apply",
+        help="Activate a scene via POST /scene/apply (audio-sync-web must run)",
+    )
+    p_sa.add_argument("name", help="Scene name (slug)")
+    p_sa.set_defaults(func=cmd_scene_apply)
+
+    ns = ap.parse_args()
+    return ns.func(ns)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

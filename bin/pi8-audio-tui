@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+pi8-audio-tui — local curses UI for scene presets and audio_profile.
+Requires audio-sync-web on http://127.0.0.1:8083 for apply / profile toggle.
+"""
+from __future__ import annotations
+
+import curses
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+import pi8_presets  # noqa: E402
+
+BASE = os.environ.get("PI8_AUDIO_SYNC_URL", "http://127.0.0.1:8083")
+
+
+def _json_req(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+    url = BASE.rstrip("/") + path
+    data = None
+    headers = {}
+    if method == "POST":
+        payload = body if body is not None else {}
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode("utf-8")
+            return r.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8"))
+        except Exception:
+            return e.code, {"msg": str(e)}
+    except OSError as e:
+        return -1, {"msg": str(e)}
+
+
+def msgline(stdscr, y: int, s: str, attr: int = 0) -> None:
+    _, w = stdscr.getmaxyx()
+    stdscr.move(y, 0)
+    stdscr.clrtoeol()
+    if len(s) >= w:
+        s = s[: w - 1]
+    stdscr.addstr(y, 0, s, attr)
+
+
+def run(stdscr) -> None:
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    status = ""
+    row = 0
+
+    while True:
+        stdscr.clear()
+        my, mx = stdscr.getmaxyx()
+        lines = min(my - 3, 20)
+        stdscr.addstr(0, 0, "pi8-audio-tui", curses.A_BOLD)
+        stdscr.addstr(0, 20, f"API {BASE}", curses.A_DIM)
+        stdscr.addstr(
+            1,
+            0,
+            "↑/↓ select  Enter apply  n new  d delete  [ / ] reorder  "
+            "a audio simple↔multi  r refresh  q quit",
+            curses.A_DIM,
+        )
+
+        store = pi8_presets.load_store()
+        verr = pi8_presets.validate_scene_store(store)
+        presets = store.get("presets", []) if isinstance(store.get("presets"), list) else []
+        if not isinstance(presets, list):
+            presets = []
+        if presets and row >= len(presets):
+            row = len(presets) - 1
+        if verr:
+            msgline(stdscr, my - 2, f"! store invalid: {verr}", curses.A_BOLD)
+        elif not presets:
+            msgline(stdscr, 3, "(no scenes — press n to add template, then edit file)", 0)
+        else:
+            for i in range(min(len(presets), lines)):
+                p = presets[i]
+                name = str(p.get("name", "?"))
+                label = str(p.get("label", name))
+                line = f" {name} — {label}"[: mx - 1]
+                att = curses.A_REVERSE if i == row else 0
+                stdscr.addstr(3 + i, 0, line, att)
+
+        if status:
+            msgline(stdscr, my - 2, status, curses.A_DIM)
+
+        ch = stdscr.getch()
+        if ch in (ord("q"), ord("Q")):
+            return
+        if ch == ord("r"):
+            status = "refreshed"
+            continue
+        if ch == ord("a"):
+            code, js = _json_req("GET", "/state")
+            if code != 200:
+                status = f"GET /state → {code} {js.get('msg', '')}"
+                continue
+            cur = js.get("audio_profile", "multi")
+            prof = "simple" if cur != "simple" else "multi"
+            code, js = _json_req("POST", "/audio-profile", {"profile": prof})
+            status = f"audio-profile → {prof} HTTP {code} {js.get('msg', '')}"
+            continue
+
+        if verr or not presets:
+            if ch == ord("n"):
+                tmpl = pi8_presets.default_store()
+                tmpl["presets"] = [
+                    {
+                        "name": "example",
+                        "label": "Example",
+                        "display": {"mode": "now-playing"},
+                        "audio": {
+                            "profile": "simple",
+                            "hdmi_port": 0,
+                            "hdmi_enabled": True,
+                            "outputs_front_rear": False,
+                        },
+                    }
+                ]
+                try:
+                    pi8_presets.save_store(tmpl)
+                    status = "created ~/.config/pi8-presets.json template"
+                except ValueError as e:
+                    status = str(e)
+                except OSError as e:
+                    status = str(e)
+            continue
+
+        if ch == curses.KEY_UP and row > 0:
+            row -= 1
+        elif ch == curses.KEY_DOWN and row < len(presets) - 1:
+            row += 1
+        elif ch == ord("n"):
+            # append template preset
+            tmpl = {
+                "name": f"scene{len(presets)}",
+                "label": "New scene",
+                "display": {"mode": "off"},
+                "audio": {"profile": "simple"},
+            }
+            store.setdefault("presets", []).append(tmpl)  # type: ignore[union-attr]
+            try:
+                pi8_presets.save_store(store)
+                row = len(store["presets"]) - 1  # type: ignore[arg-type]
+                status = f"added {tmpl['name']} — edit JSON if needed"
+            except (ValueError, OSError) as e:
+                status = str(e)
+        elif ch == ord("d"):
+            store["presets"].pop(row)  # type: ignore[union-attr]
+            try:
+                pi8_presets.save_store(store)
+                row = max(0, row - 1)
+                status = "deleted"
+            except (ValueError, OSError) as e:
+                status = str(e)
+        elif ch == ord("[") and row > 0:
+            pr = store["presets"]  # type: ignore[assignment]
+            pr[row - 1], pr[row] = pr[row], pr[row - 1]
+            row -= 1
+            try:
+                pi8_presets.save_store(store)
+                status = "moved up"
+            except (ValueError, OSError) as e:
+                status = str(e)
+        elif ch == ord("]") and row < len(presets) - 1:
+            pr = store["presets"]  # type: ignore[assignment]
+            pr[row + 1], pr[row] = pr[row], pr[row + 1]
+            row += 1
+            try:
+                pi8_presets.save_store(store)
+                status = "moved down"
+            except (ValueError, OSError) as e:
+                status = str(e)
+        elif ch == ord("e"):
+            ed = os.environ.get("EDITOR", "nano")
+            path = Path.home() / ".config" / "pi8-presets.json"
+            subprocess.run([ed, str(path)], check=False)
+            status = f"exit {ed}"
+        elif ch in (10, 13):
+            name = str(presets[row].get("name", "")).strip()
+            code, js = _json_req("POST", "/scene/apply", {"name": name})
+            ok = js.get("ok", code == 200)
+            status = f"apply {name} HTTP {code} ok={ok}"
+
+
+def main() -> int:
+    try:
+        curses.wrapper(run)
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
