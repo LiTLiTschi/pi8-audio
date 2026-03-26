@@ -30,6 +30,7 @@ cp "$REPO/bin/pi8_presets.py" ~/bin/pi8_presets.py
 cp "$REPO/bin/pi8_audio_http.py" ~/bin/pi8_audio_http.py
 cp "$REPO/bin/pi8-audio-tui" ~/bin/pi8-audio-tui
 chmod +x ~/bin/pi8-audio-tui
+# pi8_audio_http.py is a library module (imported by pi8-audio-tui); no +x required
 
 echo "Deploying pi8-tty-dash (TTY1 status loop)..."
 cp "$REPO/bin/pi8-tty-dash" ~/bin/pi8-tty-dash

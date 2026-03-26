@@ -14,7 +14,7 @@ Phone (BT AVRCP) → mpris-proxy → playerctl → display-daemon
 
 | Service | Port | Description |
 |---|---|---|
-| `audio-sync-web` | 8083 | Web UI — mode switching, outputs, display control |
+| `audio-sync-web` | 8083 | HTTP control plane; `/` is a slim launcher + status (advanced tuning in TUI) |
 | `display-daemon` | 8084 | HDMI display controller (localhost only) |
 | `mpris-proxy` | — | BlueZ AVRCP → MPRIS2 bridge |
 
@@ -90,8 +90,35 @@ systemctl --user restart display-daemon
 - Bluetooth speaker (for bedroom)
 - Android phone as BT source
 
-## Web UI
+## Operations (TUI-first)
 
-Open `http://pi8:8083` — on mobile: tab bar (🎵 Audio / 🖥 Display); on desktop (≥900px): two-column layout.
+Power-user tuning (routing, outputs, sync delay, buffers, display options, presets, services, calibration) runs on the Pi via **`pi8-audio-tui`**. The browser UI at `/` is intentionally thin: links plus live JSON status. Same HTTP API as before; the TUI calls it via **`PI8_AUDIO_SYNC_URL`** (default `http://127.0.0.1:8083`).
 
-**Minimal phone page:** `http://pi8:8083/m` — display mode only + **scenes** (no volume or calibration). **Scenes** live in `~/.config/pi8-presets.json` (display + audio bundle). Manage them on the Pi with **`pi8-audio-tui`** (↑↓ Enter apply, `n`/`d`/`[`/`]`, `e` opens `$EDITOR`, `a` toggles `audio_profile` simple↔multi via the API). After **`deploy.sh`**, **`audio`** is a shell alias for that TUI (hook in `~/.bashrc` → `~/.config/pi8-audio-aliases.sh`); run **`source ~/.bashrc`** once if the alias is missing. **`audio_profile`:** `simple` = Bluetooth (and default sink) to HDMI without PipeWire `combine-stream`; `multi` = previous multi-output + combined sink behavior. Legacy **audio presets** in the full UI still use the nested `presets` object inside `~/.config/audio-sync.json` (unrelated to scene file).
+**Launch:** `audio` (shell alias after **`deploy.sh`** — see `~/.config/pi8-audio-aliases.sh` and `~/.bashrc`; run `source ~/.bashrc` if the alias is missing) or **`python3 ~/bin/pi8-audio-tui`**.
+
+| TUI area | What it does |
+|----------|----------------|
+| **Dashboard** | Snapshot of stack state: HTTP `/state`, display state, optional PipeWire/journal hints. |
+| **Audio** | Submenus for channel mode, HDMI/outputs, source, Scream/network config, sync delay, ALSA buffers, balance/volume — parity with former main-page sliders. |
+| **Display** | Display mode, overlay, themes, sleep timer, etc. via `POST /display` (advanced JSON can be edited in-place or via temp file). |
+| **Presets** | **Scenes** (`pi8_presets` + `/scene/apply`) and **legacy** audio presets (`/presets/*`, `audio-sync.json`). **Scenes** file: `~/.config/pi8-presets.json` (display + audio bundle). |
+| **System** | Service restarts (PipeWire stack, Bluetooth, etc.), power/stop where exposed, Bluetooth adapter when available. |
+| **Tools** | Calibration stream, sync test tone — with confirmation where destructive. |
+
+### Web routes (`audio-sync-web`)
+
+| Path | Role |
+|------|------|
+| **`/`** | Slim launcher + live JSON status (`/state`, `/display-state`, `/apply-status`-style fetches). |
+| **`/m`** | Phone: **scenes** + display-focused controls (minimal; no full calibration UI). |
+| **`/remote`** | Transport and volume remote. |
+| **`/debug`**, **`/display-log-ui`** | Debug and display log viewer. |
+
+Open **`http://pi8:8083`** from a desktop browser for the launcher; use **`/m`** on the phone for scenes + display.
+
+### `audio_profile` (simple vs multi)
+
+- **`simple`** — Bluetooth (and default sink) toward HDMI without the PipeWire **combine-stream** path; multi-room delay/surround tuning may be ignored by apply logic.
+- **`multi`** — Full multi-output + combined-sink behavior (previous “full” stack).
+
+Legacy **audio presets** (nested `presets` in `~/.config/audio-sync.json`) are separate from **scenes**; both are manageable from the TUI **Presets** area.
