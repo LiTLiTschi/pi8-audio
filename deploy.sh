@@ -55,6 +55,21 @@ EOS
   echo "Appended TTY1 autostart hook to $hook_rc (login on tty1 only)."
 fi
 
+echo "Deploying ~/.config/pi8-audio-aliases.sh (alias audio → pi8-audio-tui)..."
+cp "$REPO/config/pi8-audio-aliases.sh" ~/.config/pi8-audio-aliases.sh
+ALIAS_MARK='# >>> pi8-audio aliases (deploy.sh)'
+bashrc="${HOME}/.bashrc"
+touch "$bashrc"
+if ! grep -qF "$ALIAS_MARK" "$bashrc" 2>/dev/null; then
+  cat >> "$bashrc" <<'EOS'
+
+# >>> pi8-audio aliases (deploy.sh)
+[ -r "${HOME}/.config/pi8-audio-aliases.sh" ] && . "${HOME}/.config/pi8-audio-aliases.sh"
+# <<< pi8-audio aliases
+EOS
+  echo "Appended pi8-audio alias hook to $bashrc (open a new shell or: source ~/.bashrc)."
+fi
+
 echo "Deploying getty@tty1 autologin (sudo) — edit config/.../autologin.conf if user ≠ liu..."
 sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
 sudo cp "$REPO/config/systemd/getty@tty1.service.d/autologin.conf" \
