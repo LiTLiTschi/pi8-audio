@@ -32,9 +32,22 @@ MENU_LABELS = [
     "Quit",
 ]
 
-# view name (excluding menu) for placeholders
-PLACEHOLDER_VIEWS = frozenset({"audio", "display", "presets", "system", "tools"})
+AUDIO_MENU = [
+    "Routing (stereo / surround)",
+    "Outputs (HDMI, front+rear)",
+    "Source",
+    "Network (Scream)",
+    "Sync delay",
+    "ALSA buffers",
+    "Levels (balance, volume)",
+]
 
+BUFFER_PRESETS = [256, 512, 1024, 2048, 4096]
+RATE_OPTIONS = (44100, 48000, 96000, 192000)
+FORMAT_OPTIONS = ("s16", "s32", "f32")
+
+# view name (excluding menu) for placeholders (not Audio — has real screens)
+PLACEHOLDER_VIEWS = frozenset({"display", "presets", "system", "tools"})
 
 def _trunc(s: str, w: int) -> str:
     if w <= 0:
@@ -53,6 +66,95 @@ def safe_addstr(stdscr, y: int, x: int, s: str, attr: int = 0) -> None:
         stdscr.addstr(y, x, s, attr)
     except curses.error:
         pass
+
+
+def draw_simple_profile_warning(stdscr) -> bool:
+    """Return True if user confirms continue, False to cancel (default No)."""
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    lines = [
+        "simple profile ignores delay/surround;",
+        "continue?",
+        "",
+        "y = yes, any other key = no",
+    ]
+    for i, ln in enumerate(lines):
+        safe_addstr(stdscr, 2 + i, 0, _trunc(ln, mx), curses.A_BOLD if i < 2 else 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Warning — profile", mx), curses.A_DIM)
+    stdscr.nodelay(False)
+    ch = stdscr.getch()
+    return ch in (ord("y"), ord("Y"))
+
+
+def _read_line_cell(stdscr, row: int, col: int, max_len: int) -> str:
+    curses.echo()
+    curses.curs_set(1)
+    try:
+        raw = stdscr.getstr(row, col, max_len)
+        return raw.decode("utf-8", errors="replace").strip()
+    except curses.error:
+        return ""
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+
+
+def read_int_bottom(
+    stdscr, prompt: str, min_v: int, max_v: int, default: int | None = None
+) -> int | None:
+    """Return int in range, None if cancelled (empty line, no default)."""
+    my, mx = stdscr.getmaxyx()
+    r = my - 2
+    full = prompt
+    if default is not None:
+        full += f" [Enter={default}]"
+    full += ": "
+    safe_addstr(stdscr, r, 0, _trunc(full, mx))
+    stdscr.clrtoeol()
+    maxc = max(4, mx - len(full) - 1)
+    text = _read_line_cell(stdscr, r, min(len(full), mx - 1), maxc)
+    if not text:
+        return default
+    try:
+        v = int(text)
+    except ValueError:
+        return None
+    if min_v <= v <= max_v:
+        return v
+    return None
+
+
+def fmt_network_status_summary(d: dict) -> list[str]:
+    lines: list[str] = []
+    if d.get("running"):
+        pid = d.get("pid", "?")
+        up = d.get("uptime_s", 0)
+        try:
+            up = int(up)
+        except (TypeError, ValueError):
+            up = 0
+        m, s = divmod(up, 60)
+        lines.append(f"Receiver: running (PID {pid}, {m}m{s}s)")
+    else:
+        ec = d.get("exit_code")
+        lines.append(
+            f"Receiver: stopped"
+            + (f" (exit {ec})" if ec is not None else "")
+        )
+    cfg = d.get("config") or {}
+    if cfg:
+        lines.append(
+            f"Config: group={cfg.get('group')} port={cfg.get('port')} "
+            f"iface={cfg.get('iface')!r} unicast={cfg.get('unicast')} "
+            f"rate={cfg.get('rate')} fmt={cfg.get('format')}"
+        )
+    lines.append(f"Host: {d.get('hostname', '?')}  IP: {d.get('pi_ip', '?')}")
+    ifaces = d.get("interfaces") or []
+    if ifaces:
+        lines.append("Interfaces:")
+        for iface in ifaces[:8]:
+            lines.append(f"  {iface.get('name', '?')}: {iface.get('ip', '?')}")
+    return lines
 
 
 def collect_dashboard_lines(mx: int) -> tuple[list[str], list[str]]:
@@ -174,6 +276,21 @@ def draw_menu(stdscr, sel: int) -> None:
     safe_addstr(stdscr, my - 1, 0, _trunc("Select screen", mx), curses.A_DIM)
 
 
+def draw_audio_menu(stdscr, sel: int, status: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Audio", curses.A_BOLD)
+    safe_addstr(stdscr, 1, 0, _trunc("1-7 open  q back to main menu", mx), curses.A_DIM)
+    for i, label in enumerate(AUDIO_MENU):
+        row = 3 + i
+        line = f" {i + 1}. {label}"
+        att = curses.A_REVERSE if i == sel else 0
+        safe_addstr(stdscr, row, 0, _trunc(line, mx), att)
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Audio submenu", mx), curses.A_DIM)
+
+
 def draw_placeholder(stdscr, title: str) -> None:
     stdscr.erase()
     my, mx = stdscr.getmaxyx()
@@ -248,6 +365,25 @@ def run(stdscr) -> None:
     dash_err_n = 0
     dash_scroll = 0
 
+    audio_menu_sel = 0
+    audio_status = ""
+
+    # Outputs screen local state (refreshed on entry / 'r')
+    out_fr = True
+    hdmi_en = False
+    hdmi_port = 0
+
+    # Network config edit buffer
+    net_cfg: dict = {}
+
+    # Sync delay
+    sync_sel = 0  # 0 none, 1 front, 2 rear
+    sync_delay_ms = 0.0
+
+    # Buffers: indices into BUFFER_PRESETS
+    buf_i_front = 3  # 2048 default
+    buf_i_rear = 1  # 512 default
+
     def refresh_dashboard() -> None:
         nonlocal dash_body, dash_err_n, dash_scroll
         mx = stdscr.getmaxyx()[1]
@@ -255,8 +391,204 @@ def run(stdscr) -> None:
         dash_body, dash_err_n = merge_dashboard_body(errors, lines)
         dash_scroll = 0
 
+    def load_outputs_from_state() -> None:
+        nonlocal out_fr, hdmi_en, hdmi_port
+        st = pi8_audio_http.get_state()
+        out_fr = bool(st.get("outputs_front_rear", True))
+        hdmi_en = bool(st.get("hdmi_enabled", False))
+        hdmi_port = int(st.get("hdmi_port", 0) or 0)
+
+    def load_net_cfg_from_api() -> None:
+        nonlocal net_cfg
+        try:
+            ns = pi8_audio_http.get_network_status()
+            cfg = dict(ns.get("config") or {})
+            net_cfg = {
+                "group": str(cfg.get("group", "239.255.77.77")),
+                "port": int(cfg.get("port", 4010)),
+                "iface": str(cfg.get("iface", "")),
+                "unicast": bool(cfg.get("unicast", False)),
+                "rate": int(cfg.get("rate", 48000)),
+                "format": str(cfg.get("format", "s16")),
+            }
+        except (pi8_audio_http.Pi8AudioHttpError, OSError, TypeError, ValueError):
+            net_cfg = {
+                "group": "239.255.77.77",
+                "port": 4010,
+                "iface": "",
+                "unicast": False,
+                "rate": 48000,
+                "format": "s16",
+            }
+
+    def load_buffer_indices() -> None:
+        nonlocal buf_i_front, buf_i_rear
+        try:
+            st = pi8_audio_http.get_state()
+            bf = int(st.get("buffer_front", 2048))
+            br = int(st.get("buffer_rear", 512))
+            if bf in BUFFER_PRESETS:
+                buf_i_front = BUFFER_PRESETS.index(bf)
+            if br in BUFFER_PRESETS:
+                buf_i_rear = BUFFER_PRESETS.index(br)
+        except (pi8_audio_http.Pi8AudioHttpError, OSError, ValueError):
+            pass
+
+    def target_from_sel() -> str | None:
+        return [None, "front", "rear"][sync_sel]
+
+    def draw_routing() -> None:
+        stdscr.erase()
+        my, mx = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 0, "Audio — Routing", curses.A_BOLD)
+        mode = "?"
+        try:
+            st = pi8_audio_http.get_state()
+            mode = str(st.get("mode", "?"))
+        except (pi8_audio_http.Pi8AudioHttpError, OSError):
+            pass
+        safe_addstr(stdscr, 2, 0, _trunc(f"Current mode: {mode}", mx), 0)
+        safe_addstr(stdscr, 4, 0, "1 = stereo   2 = surround   q = back", 0)
+        if audio_status:
+            safe_addstr(stdscr, my - 3, 0, _trunc(audio_status, mx), 0)
+        safe_addstr(stdscr, my - 1, 0, _trunc("Routing", mx), curses.A_DIM)
+
+    def draw_outputs() -> None:
+        stdscr.erase()
+        my, mx = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 0, "Audio — Outputs", curses.A_BOLD)
+        safe_addstr(stdscr, 2, 0, _trunc(f"Front+rear: {'on' if out_fr else 'off'}", mx), 0)
+        safe_addstr(stdscr, 3, 0, _trunc(f"HDMI enabled: {'on' if hdmi_en else 'off'}", mx), 0)
+        safe_addstr(stdscr, 4, 0, _trunc(f"HDMI port: {hdmi_port} (0 or 1)", mx), 0)
+        safe_addstr(stdscr, 6, 0, "f toggle front+rear  h toggle HDMI  p cycle port (0/1)", 0)
+        safe_addstr(stdscr, 7, 0, "a apply (POST /hdmi)  r reload from state  q back", 0)
+        if audio_status:
+            safe_addstr(stdscr, my - 3, 0, _trunc(audio_status, mx), 0)
+        safe_addstr(stdscr, my - 1, 0, _trunc("Outputs", mx), curses.A_DIM)
+
+    def draw_source() -> None:
+        stdscr.erase()
+        my, mx = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 0, "Audio — Source", curses.A_BOLD)
+        try:
+            st = pi8_audio_http.get_state()
+            cur = st.get("source", "?")
+        except (pi8_audio_http.Pi8AudioHttpError, OSError):
+            cur = "?"
+        safe_addstr(stdscr, 2, 0, _trunc(f"Current: {cur}", mx), 0)
+        safe_addstr(stdscr, 4, 0, "1 bluetooth  2 local  3 usb  4 network  q back", 0)
+        if audio_status:
+            safe_addstr(stdscr, my - 3, 0, _trunc(audio_status, mx), 0)
+        safe_addstr(stdscr, my - 1, 0, _trunc("Source", mx), curses.A_DIM)
+
+    def draw_network() -> None:
+        stdscr.erase()
+        my, mx = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 0, "Audio — Network (Scream)", curses.A_BOLD)
+        row = 2
+        try:
+            ns = pi8_audio_http.get_network_status()
+            for ln in fmt_network_status_summary(ns):
+                safe_addstr(stdscr, row, 0, _trunc(ln, mx), 0)
+                row += 1
+                if row >= my - 8:
+                    break
+        except (pi8_audio_http.Pi8AudioHttpError, OSError) as e:
+            safe_addstr(stdscr, row, 0, _trunc(f"status error: {e}", mx), 0)
+            row += 1
+        row += 1
+        safe_addstr(stdscr, row, 0, "— Edit (saved fields) —", curses.A_DIM)
+        row += 1
+        safe_addstr(
+            stdscr,
+            row,
+            0,
+            _trunc(
+                f"group={net_cfg.get('group')}  port={net_cfg.get('port')}  "
+                f"iface={net_cfg.get('iface')!r}",
+                mx,
+            ),
+            0,
+        )
+        row += 1
+        safe_addstr(
+            stdscr,
+            row,
+            0,
+            _trunc(
+                f"unicast={net_cfg.get('unicast')}  rate={net_cfg.get('rate')}  "
+                f"format={net_cfg.get('format')}",
+                mx,
+            ),
+            0,
+        )
+        row += 2
+        safe_addstr(
+            stdscr,
+            row,
+            0,
+            "g group  p port  i iface  u unicast  t rate  f format  s save  r refresh  q back",
+            0,
+        )
+        if audio_status:
+            safe_addstr(stdscr, my - 3, 0, _trunc(audio_status, mx), 0)
+        safe_addstr(stdscr, my - 1, 0, _trunc("Network", mx), curses.A_DIM)
+
+    def draw_sync() -> None:
+        stdscr.erase()
+        my, mx = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 0, "Audio — Sync delay", curses.A_BOLD)
+        names = ("none", "front", "rear")
+        safe_addstr(
+            stdscr,
+            2,
+            0,
+            _trunc(f"Target: {names[sync_sel]}  Delay: {sync_delay_ms:g} ms", mx),
+            0,
+        )
+        safe_addstr(stdscr, 4, 0, "n / f / r = target none|front|rear   +/- adjust 5 ms", 0)
+        safe_addstr(stdscr, 5, 0, "d = set delay (0–500 ms)  a = apply (POST /apply)  q back", 0)
+        if audio_status:
+            safe_addstr(stdscr, my - 3, 0, _trunc(audio_status, mx), 0)
+        safe_addstr(stdscr, my - 1, 0, _trunc("Sync", mx), curses.A_DIM)
+
+    def draw_buffers() -> None:
+        stdscr.erase()
+        my, mx = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 0, "Audio — ALSA buffers", curses.A_BOLD)
+        bf = BUFFER_PRESETS[buf_i_front]
+        br = BUFFER_PRESETS[buf_i_rear]
+        safe_addstr(stdscr, 2, 0, _trunc(f"Front: {bf}   Rear: {br}", mx), 0)
+        safe_addstr(stdscr, 4, 0, "[ ] cycle front   { } cycle rear   a apply  r reload  q back", 0)
+        if audio_status:
+            safe_addstr(stdscr, my - 3, 0, _trunc(audio_status, mx), 0)
+        safe_addstr(stdscr, my - 1, 0, _trunc("Buffers", mx), curses.A_DIM)
+
+    def draw_levels() -> None:
+        stdscr.erase()
+        my, mx = stdscr.getmaxyx()
+        safe_addstr(stdscr, 0, 0, "Audio — Levels", curses.A_BOLD)
+        bal = vol = muted = "?"
+        try:
+            st = pi8_audio_http.get_state()
+            bal = st.get("balance", "?")
+        except (pi8_audio_http.Pi8AudioHttpError, OSError):
+            pass
+        try:
+            v = pi8_audio_http.get_volume()
+            vol = v.get("volume", "?")
+            muted = v.get("muted", "?")
+        except (pi8_audio_http.Pi8AudioHttpError, OSError):
+            pass
+        safe_addstr(stdscr, 2, 0, _trunc(f"Balance: {bal}  Volume: {vol}%  Muted: {muted}", mx), 0)
+        safe_addstr(stdscr, 4, 0, "b balance  v volume  m mute toggle  r refresh  q back", 0)
+        if audio_status:
+            safe_addstr(stdscr, my - 3, 0, _trunc(audio_status, mx), 0)
+        safe_addstr(stdscr, my - 1, 0, _trunc("Levels", mx), curses.A_DIM)
+
     while True:
         stdscr.timeout(-1)
+
         if view == "menu":
             draw_menu(stdscr, menu_sel)
         elif view == "dashboard":
@@ -267,6 +599,22 @@ def run(stdscr) -> None:
             max_scroll = max(0, len(dash_body) - avail)
             dash_scroll = min(dash_scroll, max_scroll)
             draw_dashboard(stdscr, dash_body, dash_err_n, dash_scroll)
+        elif view == "audio":
+            draw_audio_menu(stdscr, audio_menu_sel, audio_status)
+        elif view == "audio_routing":
+            draw_routing()
+        elif view == "audio_outputs":
+            draw_outputs()
+        elif view == "audio_source":
+            draw_source()
+        elif view == "audio_network":
+            draw_network()
+        elif view == "audio_sync":
+            draw_sync()
+        elif view == "audio_buffers":
+            draw_buffers()
+        elif view == "audio_levels":
+            draw_levels()
         elif view in PLACEHOLDER_VIEWS:
             title = view.capitalize() if view != "presets" else "Presets"
             draw_placeholder(stdscr, title)
@@ -290,6 +638,8 @@ def run(stdscr) -> None:
                 view = dest
                 if view == "dashboard":
                     refresh_dashboard()
+                elif view == "audio":
+                    audio_menu_sel = 0
             elif ch in (10, 13):
                 dest = apply_menu_selection(menu_sel)
                 if dest is None:
@@ -297,6 +647,8 @@ def run(stdscr) -> None:
                 view = dest
                 if view == "dashboard":
                     refresh_dashboard()
+                elif view == "audio":
+                    audio_menu_sel = 0
             continue
 
         if view == "dashboard":
@@ -314,6 +666,308 @@ def run(stdscr) -> None:
                 dash_scroll -= 1
             elif ch == curses.KEY_DOWN and dash_scroll < max_scroll:
                 dash_scroll += 1
+            continue
+
+        if view == "audio":
+            if ch in (ord("q"), ord("Q")):
+                view = "menu"
+                audio_status = ""
+                continue
+            if ch == curses.KEY_UP and audio_menu_sel > 0:
+                audio_menu_sel -= 1
+            elif ch == curses.KEY_DOWN and audio_menu_sel < len(AUDIO_MENU) - 1:
+                audio_menu_sel += 1
+            elif ord("1") <= ch <= ord("7"):
+                audio_menu_sel = ch - ord("1")
+                sub = [
+                    "audio_routing",
+                    "audio_outputs",
+                    "audio_source",
+                    "audio_network",
+                    "audio_sync",
+                    "audio_buffers",
+                    "audio_levels",
+                ][audio_menu_sel]
+                view = sub
+                audio_status = ""
+                if view == "audio_outputs":
+                    load_outputs_from_state()
+                elif view == "audio_network":
+                    load_net_cfg_from_api()
+                elif view == "audio_sync":
+                    try:
+                        st = pi8_audio_http.get_state()
+                        t = st.get("target")
+                        d = float(st.get("delay_ms", 0))
+                        sync_delay_ms = d
+                        if t == "front":
+                            sync_sel = 1
+                        elif t == "rear":
+                            sync_sel = 2
+                        else:
+                            sync_sel = 0
+                    except (pi8_audio_http.Pi8AudioHttpError, OSError, TypeError, ValueError):
+                        sync_sel = 0
+                        sync_delay_ms = 0.0
+                elif view == "audio_buffers":
+                    load_buffer_indices()
+            elif ch in (10, 13):
+                sub = [
+                    "audio_routing",
+                    "audio_outputs",
+                    "audio_source",
+                    "audio_network",
+                    "audio_sync",
+                    "audio_buffers",
+                    "audio_levels",
+                ][audio_menu_sel]
+                view = sub
+                audio_status = ""
+                if view == "audio_outputs":
+                    load_outputs_from_state()
+                elif view == "audio_network":
+                    load_net_cfg_from_api()
+                elif view == "audio_sync":
+                    try:
+                        st = pi8_audio_http.get_state()
+                        t = st.get("target")
+                        d = float(st.get("delay_ms", 0))
+                        sync_delay_ms = d
+                        if t == "front":
+                            sync_sel = 1
+                        elif t == "rear":
+                            sync_sel = 2
+                        else:
+                            sync_sel = 0
+                    except (pi8_audio_http.Pi8AudioHttpError, OSError, TypeError, ValueError):
+                        sync_sel = 0
+                        sync_delay_ms = 0.0
+                elif view == "audio_buffers":
+                    load_buffer_indices()
+            continue
+
+        if view == "audio_routing":
+            if ch in (ord("q"), ord("Q")):
+                view = "audio"
+                continue
+            if ch == ord("1"):
+                try:
+                    out = pi8_audio_http.post_mode("stereo")
+                    audio_status = str(out.get("msg", out))
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    audio_status = str(e)
+            elif ch == ord("2"):
+                try:
+                    st = pi8_audio_http.get_state()
+                    if st.get("audio_profile") == "simple":
+                        if not draw_simple_profile_warning(stdscr):
+                            continue
+                    out = pi8_audio_http.post_mode("surround")
+                    audio_status = str(out.get("msg", out))
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    audio_status = str(e)
+            continue
+
+        if view == "audio_outputs":
+            if ch in (ord("q"), ord("Q")):
+                view = "audio"
+                continue
+            if ch == ord("f"):
+                out_fr = not out_fr
+            elif ch == ord("h"):
+                hdmi_en = not hdmi_en
+            elif ch == ord("p"):
+                hdmi_port = 1 - hdmi_port if hdmi_port in (0, 1) else 0
+            elif ch == ord("r"):
+                load_outputs_from_state()
+            elif ch == ord("a"):
+                try:
+                    out = pi8_audio_http.post_hdmi(
+                        hdmi_en, port=hdmi_port, outputs_front_rear=out_fr
+                    )
+                    audio_status = str(out.get("msg", out))
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    audio_status = str(e)
+            draw_outputs()
+            continue
+
+        if view == "audio_source":
+            if ch in (ord("q"), ord("Q")):
+                view = "audio"
+                continue
+            src_map = {
+                ord("1"): "bluetooth",
+                ord("2"): "local",
+                ord("3"): "usb",
+                ord("4"): "network",
+            }
+            if ch in src_map:
+                try:
+                    out = pi8_audio_http.post_source(src_map[ch])
+                    audio_status = str(out.get("msg", out))
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    audio_status = str(e)
+            draw_source()
+            continue
+
+        if view == "audio_network":
+            if ch in (ord("q"), ord("Q")):
+                view = "audio"
+                continue
+            if ch == ord("r"):
+                load_net_cfg_from_api()
+            elif ch == ord("g"):
+                stdscr.erase()
+                my, mx = stdscr.getmaxyx()
+                safe_addstr(stdscr, my - 2, 0, _trunc("Multicast group: ", mx))
+                v = _read_line_cell(stdscr, my - 2, len("Multicast group: "), mx - 20)
+                if v:
+                    net_cfg["group"] = v
+            elif ch == ord("p"):
+                stdscr.erase()
+                draw_network()
+                vp = read_int_bottom(stdscr, "Port", 1, 65535, net_cfg.get("port", 4010))
+                if vp is not None:
+                    net_cfg["port"] = vp
+            elif ch == ord("i"):
+                stdscr.erase()
+                my, mx = stdscr.getmaxyx()
+                safe_addstr(stdscr, my - 2, 0, _trunc("Interface (empty=all): ", mx))
+                v = _read_line_cell(stdscr, my - 2, len("Interface (empty=all): "), mx - 25)
+                if v is not None:
+                    net_cfg["iface"] = v
+            elif ch == ord("u"):
+                net_cfg["unicast"] = not bool(net_cfg.get("unicast"))
+            elif ch == ord("t"):
+                r = int(net_cfg.get("rate", 48000))
+                try:
+                    i = RATE_OPTIONS.index(r)
+                except ValueError:
+                    i = 1
+                net_cfg["rate"] = RATE_OPTIONS[(i + 1) % len(RATE_OPTIONS)]
+            elif ch == ord("f"):
+                f = str(net_cfg.get("format", "s16"))
+                try:
+                    i = FORMAT_OPTIONS.index(f)
+                except ValueError:
+                    i = 0
+                net_cfg["format"] = FORMAT_OPTIONS[(i + 1) % len(FORMAT_OPTIONS)]
+            elif ch == ord("s"):
+                try:
+                    out = pi8_audio_http.post_network_config(
+                        group=str(net_cfg["group"]),
+                        port=int(net_cfg["port"]),
+                        iface=str(net_cfg.get("iface", "")),
+                        unicast=bool(net_cfg.get("unicast")),
+                        rate=int(net_cfg["rate"]),
+                        format=str(net_cfg["format"]),
+                    )
+                    audio_status = str(out.get("msg", out))
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    audio_status = str(e)
+            draw_network()
+            continue
+
+        if view == "audio_sync":
+            if ch in (ord("q"), ord("Q")):
+                view = "audio"
+                continue
+            if ch == ord("n"):
+                sync_sel = 0
+            elif ch == ord("f"):
+                sync_sel = 1
+            elif ch == ord("r"):
+                sync_sel = 2
+            elif ch == ord("+"):
+                sync_delay_ms = min(500.0, sync_delay_ms + 5.0)
+            elif ch == ord("-") or ch == ord("_"):
+                sync_delay_ms = max(0.0, sync_delay_ms - 5.0)
+            elif ch == ord("d"):
+                stdscr.erase()
+                draw_sync()
+                vd = read_int_bottom(stdscr, "Delay ms", 0, 500, int(round(sync_delay_ms)))
+                if vd is not None:
+                    sync_delay_ms = float(vd)
+            elif ch == ord("a"):
+                try:
+                    if sync_delay_ms != 0:
+                        st = pi8_audio_http.get_state()
+                        if st.get("audio_profile") == "simple":
+                            if not draw_simple_profile_warning(stdscr):
+                                continue
+                    out = pi8_audio_http.post_apply_delay(target_from_sel(), sync_delay_ms)
+                    parts = [str(out.get("msg", ""))]
+                    if out.get("applying"):
+                        parts.append("202 async — polled /apply-status")
+                        try:
+                            st2 = pi8_audio_http.get_apply_status()
+                            parts.append(json.dumps(st2, sort_keys=True))
+                        except (pi8_audio_http.Pi8AudioHttpError, OSError):
+                            pass
+                    audio_status = " | ".join(p for p in parts if p)
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    audio_status = str(e)
+            draw_sync()
+            continue
+
+        if view == "audio_buffers":
+            if ch in (ord("q"), ord("Q")):
+                view = "audio"
+                continue
+            if ch == ord("["):
+                buf_i_front = (buf_i_front - 1) % len(BUFFER_PRESETS)
+            elif ch == ord("]"):
+                buf_i_front = (buf_i_front + 1) % len(BUFFER_PRESETS)
+            elif ch == ord("{"):
+                buf_i_rear = (buf_i_rear - 1) % len(BUFFER_PRESETS)
+            elif ch == ord("}"):
+                buf_i_rear = (buf_i_rear + 1) % len(BUFFER_PRESETS)
+            elif ch == ord("r"):
+                load_buffer_indices()
+            elif ch == ord("a"):
+                try:
+                    out = pi8_audio_http.post_buffers(
+                        BUFFER_PRESETS[buf_i_front], BUFFER_PRESETS[buf_i_rear]
+                    )
+                    audio_status = str(out.get("msg", out))
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    audio_status = str(e)
+            draw_buffers()
+            continue
+
+        if view == "audio_levels":
+            if ch in (ord("q"), ord("Q")):
+                view = "audio"
+                continue
+            if ch == ord("r"):
+                pass
+            elif ch == ord("b"):
+                stdscr.erase()
+                draw_levels()
+                vb = read_int_bottom(stdscr, "Balance", -100, 100, None)
+                if vb is not None:
+                    try:
+                        out = pi8_audio_http.post_balance(vb)
+                        audio_status = str(out.get("msg", out))
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        audio_status = str(e)
+            elif ch == ord("v"):
+                stdscr.erase()
+                draw_levels()
+                vv = read_int_bottom(stdscr, "Volume %", 0, 100, None)
+                if vv is not None:
+                    try:
+                        out = pi8_audio_http.post_volume(vv, mute_toggle=False)
+                        audio_status = str(out.get("msg", out))
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        audio_status = str(e)
+            elif ch == ord("m"):
+                try:
+                    out = pi8_audio_http.post_volume(0, mute_toggle=True)
+                    audio_status = str(out.get("msg", out))
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    audio_status = str(e)
+            draw_levels()
             continue
 
         if view in PLACEHOLDER_VIEWS:

@@ -110,6 +110,132 @@ class TestPi8AudioHttp(unittest.TestCase):
                 self.assertIsNone(body["target"])
                 self.assertEqual(body["delay_ms"], 0)
 
+    def test_post_source(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://example:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "msg": "ok"}).encode()
+                )
+                pi8_audio_http.post_source("network")
+                req = m.call_args[0][0]
+                self.assertEqual(req.get_full_url(), "http://example:8083/source")
+                self.assertEqual(req.method, "POST")
+                self.assertEqual(json.loads(req.data.decode()), {"source": "network"})
+
+    def test_post_network_config(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "msg": "saved", "config": {}}).encode()
+                )
+                pi8_audio_http.post_network_config(
+                    group="239.1.1.1",
+                    port=5000,
+                    iface="eth0",
+                    unicast=True,
+                    rate=96000,
+                    format="f32",
+                )
+                req = m.call_args[0][0]
+                self.assertEqual(req.get_full_url(), "http://127.0.0.1:8083/network-config")
+                body = json.loads(req.data.decode())
+                self.assertEqual(
+                    body,
+                    {
+                        "group": "239.1.1.1",
+                        "port": 5000,
+                        "iface": "eth0",
+                        "unicast": True,
+                        "rate": 96000,
+                        "format": "f32",
+                    },
+                )
+
+    def test_get_network_status(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                payload = {"running": True, "pid": 42, "config": {"port": 4010}}
+                m.return_value = _mock_http_response(json.dumps(payload).encode())
+                out = pi8_audio_http.get_network_status()
+                self.assertEqual(out, payload)
+                req = m.call_args[0][0]
+                self.assertEqual(req.get_full_url(), "http://127.0.0.1:8083/network-status")
+                self.assertEqual(req.method, "GET")
+
+    def test_post_buffers(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://example:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "msg": "Buffer"}).encode()
+                )
+                pi8_audio_http.post_buffers(1024, 512)
+                req = m.call_args[0][0]
+                self.assertEqual(req.get_full_url(), "http://example:8083/buffers")
+                self.assertEqual(json.loads(req.data.decode()), {"front": 1024, "rear": 512})
+
+    def test_post_balance(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "msg": "bal"}).encode()
+                )
+                pi8_audio_http.post_balance(-25)
+                req = m.call_args[0][0]
+                self.assertEqual(req.get_full_url(), "http://127.0.0.1:8083/balance")
+                self.assertEqual(json.loads(req.data.decode()), {"balance": -25})
+
+    def test_post_volume_level_and_mute(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "volume": 33}).encode()
+                )
+                pi8_audio_http.post_volume(33, mute_toggle=False)
+                req = m.call_args[0][0]
+                self.assertEqual(json.loads(req.data.decode()), {"volume": 33})
+
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "volume": 33, "muted": True}).encode()
+                )
+                pi8_audio_http.post_volume(0, mute_toggle=True)
+                req = m.call_args[0][0]
+                self.assertEqual(json.loads(req.data.decode()), {"mute_toggle": True})
+
+    def test_post_audio_profile(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://example:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "msg": "ok"}).encode()
+                )
+                pi8_audio_http.post_audio_profile("multi")
+                req = m.call_args[0][0]
+                self.assertEqual(req.get_full_url(), "http://example:8083/audio-profile")
+                self.assertEqual(json.loads(req.data.decode()), {"profile": "multi"})
+
+    def test_get_apply_status(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                st = {"state": "idle", "error": None}
+                m.return_value = _mock_http_response(json.dumps(st).encode())
+                out = pi8_audio_http.get_apply_status()
+                self.assertEqual(out, st)
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/apply-status"))
+                self.assertEqual(req.method, "GET")
+
+    def test_get_volume(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"volume": 77, "muted": False}).encode()
+                )
+                out = pi8_audio_http.get_volume()
+                self.assertEqual(out["volume"], 77)
+                req = m.call_args[0][0]
+                self.assertEqual(req.get_full_url(), "http://127.0.0.1:8083/volume")
+                self.assertEqual(req.method, "GET")
+
 
 if __name__ == "__main__":
     unittest.main()

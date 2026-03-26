@@ -8,7 +8,7 @@ GET paths
 | Path / pattern              | Planned helper              |
 |-----------------------------|-----------------------------|
 | /state                      | get_state                   |
-| /volume                     | get_volume                  |
+| /volume                     | get_volume, post_volume     |
 | /player-status              | get_player_status           |
 | /network-status             | get_network_status          |
 | /presets                    | get_presets                 |
@@ -158,3 +158,64 @@ def post_apply_delay(target: str | None, delay_ms: float) -> dict[str, Any]:
         "/apply",
         {"target": target, "delay_ms": delay_ms},
     )
+
+
+def post_source(source: str) -> Any:
+    return _request("POST", "/source", {"source": source})
+
+
+def post_network_config(
+    *,
+    group: str = "239.255.77.77",
+    port: int = 4010,
+    iface: str = "",
+    unicast: bool = False,
+    rate: int = 48000,
+    format: str = "s16",
+) -> Any:
+    return _request(
+        "POST",
+        "/network-config",
+        {
+            "group": group,
+            "port": port,
+            "iface": iface,
+            "unicast": unicast,
+            "rate": rate,
+            "format": format,
+        },
+    )
+
+
+def get_network_status() -> dict[str, Any]:
+    return _request("GET", "/network-status")
+
+
+def post_buffers(front: int, rear: int) -> Any:
+    return _request("POST", "/buffers", {"front": front, "rear": rear})
+
+
+def post_balance(balance: int) -> Any:
+    return _request("POST", "/balance", {"balance": balance})
+
+
+def post_volume(volume: int, mute_toggle: bool = False) -> Any:
+    body: dict[str, Any]
+    if mute_toggle:
+        body = {"mute_toggle": True}
+    else:
+        body = {"volume": volume}
+    return _request("POST", "/volume", body)
+
+
+def post_audio_profile(profile: str) -> Any:
+    return _request("POST", "/audio-profile", {"profile": profile})
+
+
+def get_apply_status() -> dict[str, Any]:
+    return _request("GET", "/apply-status")
+
+
+def get_volume() -> dict[str, Any]:
+    """GET /volume — master volume 0–100 and mute flag."""
+    return _request("GET", "/volume")
