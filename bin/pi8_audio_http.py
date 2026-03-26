@@ -219,3 +219,100 @@ def get_apply_status() -> dict[str, Any]:
 def get_volume() -> dict[str, Any]:
     """GET /volume — master volume 0–100 and mute flag."""
     return _request("GET", "/volume")
+
+
+def get_presets() -> dict[str, Any]:
+    """GET /presets — legacy audio snapshots from audio-sync.json."""
+    return _request("GET", "/presets")
+
+
+def get_scenes() -> dict[str, Any]:
+    """GET /scenes — scene list from ~/.config/pi8-presets.json."""
+    return _request("GET", "/scenes")
+
+
+def post_scene_apply(name: str) -> Any:
+    return _request("POST", "/scene/apply", {"name": name})
+
+
+def post_display(body: Mapping[str, Any]) -> Any:
+    """POST /display — forwarded to display-daemon :8084 /set."""
+    return _request("POST", "/display", dict(body))
+
+
+def post_sleep_timer_minutes(minutes: float) -> Any:
+    """POST /sleep-timer — same body as web (`minutes`)."""
+    return _request("POST", "/sleep-timer", {"minutes": float(minutes)})
+
+
+def delete_sleep_timer() -> Any:
+    """DELETE /sleep-timer — cancel active timer."""
+    return _request("DELETE", "/sleep-timer", None)
+
+
+def get_sleep_timer() -> dict[str, Any]:
+    """GET /sleep-timer — active flag and remaining_seconds."""
+    return _request("GET", "/sleep-timer")
+
+
+def post_restart_service(service: str, scope: str = "user") -> Any:
+    """POST /restart-service — `service` may be space-separated (see web svc-btn)."""
+    return _request(
+        "POST",
+        "/restart-service",
+        {"service": service, "scope": scope},
+    )
+
+
+def post_power(action: str) -> Any:
+    """POST /power — action `stop` or `start`."""
+    return _request("POST", "/power", {"action": action})
+
+
+def post_calib_stream(
+    action: str,
+    *,
+    front_offset_ms: float = 0.0,
+    rear_offset_ms: float = 0.0,
+    volume: float = 70.0,
+) -> Any:
+    """POST /calib-stream — action start|stop|update (mirrors web calibStreamCall)."""
+    return _request(
+        "POST",
+        "/calib-stream",
+        {
+            "action": action,
+            "front_offset_ms": float(front_offset_ms),
+            "rear_offset_ms": float(rear_offset_ms),
+            "volume": float(volume),
+        },
+    )
+
+
+def post_play_sync_test(
+    front_offset_ms: float = 0.0, rear_offset_ms: float = 0.0
+) -> Any:
+    """POST /play-sync-test — spawns sync test tone in background."""
+    return _request(
+        "POST",
+        "/play-sync-test",
+        {
+            "front_offset_ms": float(front_offset_ms),
+            "rear_offset_ms": float(rear_offset_ms),
+        },
+    )
+
+
+def post_presets_save(name: str, snapshot_from_state: bool = True) -> Any:
+    """POST /presets — save current audio state under name (server always snapshots)."""
+    # snapshot_from_state reserved for API parity; server always uses load_state().
+    _ = snapshot_from_state
+    return _request("POST", "/presets", {"name": name.strip()})
+
+
+def post_presets_load(name: str) -> Any:
+    return _request("POST", "/presets/load", {"name": name})
+
+
+def post_presets_delete(name: str) -> Any:
+    return _request("POST", "/presets/delete", {"name": name})

@@ -8,10 +8,12 @@ from __future__ import annotations
 import curses
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -46,8 +48,37 @@ BUFFER_PRESETS = [256, 512, 1024, 2048, 4096]
 RATE_OPTIONS = (44100, 48000, 96000, 192000)
 FORMAT_OPTIONS = ("s16", "s32", "f32")
 
-# view name (excluding menu) for placeholders (not Audio — has real screens)
-PLACEHOLDER_VIEWS = frozenset({"display", "presets", "system", "tools"})
+DISPLAY_MODES = ("off", "now-playing", "visualizer", "music-video")
+VIS_THEMES = ("default", "fire", "ice", "amber", "mono")
+
+DISPLAY_MENU = [
+    "Quick (mode, overlay, mirror, lyrics, theme)",
+    "Sleep timer",
+    "Raw JSON ($EDITOR → POST /display)",
+]
+
+PRESETS_MENU = [
+    "Scenes (pi8-presets.json via HTTP)",
+    "Legacy audio presets (GET/POST /presets*)",
+]
+
+SYSTEM_MENU_LINES = [
+    ("1", "PipeWire + wireplumber", "pipewire pipewire-pulse wireplumber", "user"),
+    ("2", "Bluetooth (system)", "bluetooth", "system"),
+    ("3", "audio-sync-web", "audio-sync-web", "user"),
+    ("4", "dlna-renderer", "dlna-renderer", "user"),
+    ("5", "display-daemon", "display-daemon", "user"),
+    ("6", "mpris-proxy", "mpris-proxy", "user"),
+    ("7", "Display full restart", "DISPLAY_RESTART", "user"),
+    ("8", "ALL services", "ALL", "user"),
+]
+
+TOOLS_MENU = [
+    "Calibration stream (POST /calib-stream)",
+    "Sync test tone (POST /play-sync-test)",
+]
+
+SCENE_STORE_PATH = str(Path.home() / ".config" / "pi8-presets.json")
 
 def _trunc(s: str, w: int) -> str:
     if w <= 0:
@@ -290,13 +321,184 @@ def draw_audio_menu(stdscr, sel: int, status: str) -> None:
     safe_addstr(stdscr, my - 1, 0, _trunc("Audio submenu", mx), curses.A_DIM)
 
 
-def draw_placeholder(stdscr, title: str) -> None:
+def draw_confirm(stdscr, title: str, detail: str = "") -> bool:
+    """Return True if user confirms (y/Y)."""
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 2, 0, _trunc(title, mx), curses.A_BOLD)
+    if detail:
+        safe_addstr(stdscr, 4, 0, _trunc(detail, mx), 0)
+    safe_addstr(stdscr, my - 3, 0, "y = confirm  any other = cancel", 0)
+    stdscr.nodelay(False)
+    ch = stdscr.getch()
+    return ch in (ord("y"), ord("Y"))
+
+
+def draw_submenu(stdscr, title: str, items: list[str], sel: int, status: str, footer: str) -> None:
     stdscr.erase()
     my, mx = stdscr.getmaxyx()
     safe_addstr(stdscr, 0, 0, title, curses.A_BOLD)
-    safe_addstr(stdscr, 2, 0, "Coming in next tasks.", 0)
-    safe_addstr(stdscr, 4, 0, _trunc("Press q to return (or 0 to return).", mx), curses.A_DIM)
-    safe_addstr(stdscr, my - 1, 0, _trunc("q / 0 back", mx), curses.A_DIM)
+    safe_addstr(stdscr, 1, 0, _trunc("1-%d select  Enter  q back" % max(1, len(items)), mx), curses.A_DIM)
+    for i, label in enumerate(items):
+        row = 3 + i
+        line = f" {i + 1}. {label}"
+        att = curses.A_REVERSE if i == sel else 0
+        safe_addstr(stdscr, row, 0, _trunc(line, mx), att)
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc(footer, mx), curses.A_DIM)
+
+
+def draw_display_quick(
+    stdscr,
+    mode: str,
+    overlay: bool,
+    mirror: bool,
+    lyrics: bool,
+    theme: str,
+    status: str,
+) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Display — Quick", curses.A_BOLD)
+    safe_addstr(stdscr, 2, 0, _trunc(f"mode: {mode}", mx), 0)
+    safe_addstr(stdscr, 3, 0, _trunc(f"overlay_enabled: {overlay}", mx), 0)
+    safe_addstr(stdscr, 4, 0, _trunc(f"visualizer_mirror: {mirror}", mx), 0)
+    safe_addstr(stdscr, 5, 0, _trunc(f"lyrics_enabled: {lyrics}", mx), 0)
+    safe_addstr(stdscr, 6, 0, _trunc(f"visualizer_theme: {theme}", mx), 0)
+    safe_addstr(
+        stdscr,
+        8,
+        0,
+        "m cycle mode  o overlay  v mirror  l lyrics  t theme  a POST /display  r refresh  q back",
+        0,
+    )
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Display quick", mx), curses.A_DIM)
+
+
+def draw_display_sleep(stdscr, active: bool, remaining_s: int, status: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Display — Sleep timer", curses.A_BOLD)
+    if active:
+        m, s = divmod(max(0, remaining_s), 60)
+        safe_addstr(stdscr, 2, 0, _trunc(f"Active: {m}m {s:02d}s left", mx), 0)
+    else:
+        safe_addstr(stdscr, 2, 0, "No sleep timer.", 0)
+    safe_addstr(stdscr, 5, 0, "s set minutes (POST)  c cancel (DELETE)  r refresh  q back", 0)
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Sleep", mx), curses.A_DIM)
+
+
+def draw_display_raw(stdscr, status: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Display — Raw JSON", curses.A_BOLD)
+    safe_addstr(stdscr, 2, 0, _trunc("e dump GET /display-state to temp file, $EDITOR, POST /display", mx), 0)
+    safe_addstr(stdscr, 4, 0, _trunc(f"EDITOR={os.environ.get('EDITOR', 'nano')}", mx), curses.A_DIM)
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Raw JSON  q back", mx), curses.A_DIM)
+
+
+def draw_presets_scenes(stdscr, scenes: list[dict], sel: int, status: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Presets — Scenes", curses.A_BOLD)
+    safe_addstr(stdscr, 1, 0, _trunc("Enter apply  e edit file  r refresh  q back", mx), curses.A_DIM)
+    row = 3
+    if not scenes:
+        safe_addstr(stdscr, row, 0, "(no scenes — edit JSON or use web /m)", 0)
+    for i, sc in enumerate(scenes[: max(1, my - 8)]):
+        if row >= my - 4:
+            break
+        name = sc.get("name", "?")
+        label = sc.get("label") or ""
+        line = f" {name}"
+        if label:
+            line += f" — {label}"
+        att = curses.A_REVERSE if i == sel else 0
+        safe_addstr(stdscr, row, 0, _trunc(line, mx), att)
+        row += 1
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Scenes", mx), curses.A_DIM)
+
+
+def draw_presets_legacy(stdscr, names: list[str], sel: int, status: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Presets — Legacy", curses.A_BOLD)
+    safe_addstr(
+        stdscr,
+        1,
+        0,
+        _trunc("Enter load  s save current state  d delete  r refresh  q back", mx),
+        curses.A_DIM,
+    )
+    row = 3
+    for i, name in enumerate(names[: max(1, my - 8)]):
+        if row >= my - 4:
+            break
+        att = curses.A_REVERSE if i == sel else 0
+        safe_addstr(stdscr, row, 0, _trunc(f" {name}", mx), att)
+        row += 1
+    if not names:
+        safe_addstr(stdscr, row, 0, "(no legacy presets)", 0)
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Legacy", mx), curses.A_DIM)
+
+
+def draw_system_menu(stdscr, status: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "System — restarts & power", curses.A_BOLD)
+    safe_addstr(stdscr, 1, 0, _trunc("1-8 restart  P power stop  S power start  q back", mx), curses.A_DIM)
+    row = 3
+    for key, label, _svc, _scope in SYSTEM_MENU_LINES:
+        safe_addstr(stdscr, row, 0, _trunc(f" {key}  {label}", mx), 0)
+        row += 1
+        if row >= my - 5:
+            break
+    safe_addstr(stdscr, row + 1, 0, _trunc("Power stop/start match web /power (confirm destructive).", mx), curses.A_DIM)
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("System", mx), curses.A_DIM)
+
+
+def draw_tools_menu(stdscr, sel: int, status: str) -> None:
+    draw_submenu(stdscr, "Tools", TOOLS_MENU, sel, status, "Tools")
+
+
+def draw_tools_calib(stdscr, vol: float, fo: float, ro: float, status: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Tools — Calibration stream", curses.A_BOLD)
+    safe_addstr(stdscr, 2, 0, _trunc(f"volume={vol:g}  front_offset_ms={fo:g}  rear_offset_ms={ro:g}", mx), 0)
+    safe_addstr(
+        stdscr,
+        4,
+        0,
+        "s start (confirm)  x stop  u update  +/- volume  f/r nudge offset  q back",
+        0,
+    )
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Calib", mx), curses.A_DIM)
+
+
+def draw_tools_sync(stdscr, status: str) -> None:
+    stdscr.erase()
+    my, mx = stdscr.getmaxyx()
+    safe_addstr(stdscr, 0, 0, "Tools — Sync test", curses.A_BOLD)
+    safe_addstr(stdscr, 2, 0, _trunc("t run POST /play-sync-test (confirm)  q back", mx), 0)
+    if status:
+        safe_addstr(stdscr, my - 3, 0, _trunc(status, mx), 0)
+    safe_addstr(stdscr, my - 1, 0, _trunc("Sync test", mx), curses.A_DIM)
 
 
 def merge_dashboard_body(errors: list[str], lines: list[str]) -> tuple[list[str], int]:
@@ -352,7 +554,7 @@ def apply_menu_selection(sel: int) -> str | None:
         return "dashboard"
     if sel == 6:
         return None
-    return ["audio", "display", "presets", "system", "tools"][sel - 1]
+    return ["audio", "display_menu", "presets_menu", "system_menu", "tools_menu"][sel - 1]
 
 
 def run(stdscr) -> None:
@@ -382,6 +584,33 @@ def run(stdscr) -> None:
     # Buffers: indices into BUFFER_PRESETS
     buf_i_front = 3  # 2048 default
     buf_i_rear = 1  # 512 default
+
+    display_menu_sel = 0
+    presets_menu_sel = 0
+    tools_menu_sel = 0
+    display_status = ""
+    presets_status = ""
+    system_status = ""
+    tools_status = ""
+
+    dq_mode_i = 0
+    dq_overlay = True
+    dq_mirror = False
+    dq_lyrics = False
+    dq_theme_i = 0
+
+    sleep_active = False
+    sleep_remaining_s = 0
+
+    scenes_list: list = []
+    scene_sel = 0
+
+    legacy_names: list[str] = []
+    legacy_sel = 0
+
+    tools_calib_vol = 70.0
+    tools_calib_fo = 0.0
+    tools_calib_ro = 0.0
 
     def refresh_dashboard() -> None:
         nonlocal dash_body, dash_err_n, dash_scroll
@@ -432,6 +661,66 @@ def run(stdscr) -> None:
                 buf_i_rear = BUFFER_PRESETS.index(br)
         except (pi8_audio_http.Pi8AudioHttpError, OSError, ValueError):
             pass
+
+    def load_display_draft() -> None:
+        nonlocal dq_mode_i, dq_overlay, dq_mirror, dq_lyrics, dq_theme_i
+        try:
+            d = pi8_audio_http.get_display_state()
+            m = str(d.get("mode", "off"))
+            if m in DISPLAY_MODES:
+                dq_mode_i = DISPLAY_MODES.index(m)
+            else:
+                dq_mode_i = 0
+            dq_overlay = bool(d.get("overlay_enabled", True))
+            dq_mirror = bool(d.get("visualizer_mirror", False))
+            dq_lyrics = bool(d.get("lyrics_enabled", False))
+            th = str(d.get("visualizer_theme", "default"))
+            if th in VIS_THEMES:
+                dq_theme_i = VIS_THEMES.index(th)
+            else:
+                dq_theme_i = 0
+        except (pi8_audio_http.Pi8AudioHttpError, OSError, TypeError, ValueError):
+            pass
+
+    def load_sleep_status() -> None:
+        nonlocal sleep_active, sleep_remaining_s
+        try:
+            s = pi8_audio_http.get_sleep_timer()
+            sleep_active = bool(s.get("active"))
+            sleep_remaining_s = int(s.get("remaining_seconds", 0) or 0)
+        except (pi8_audio_http.Pi8AudioHttpError, OSError, TypeError, ValueError):
+            sleep_active = False
+            sleep_remaining_s = 0
+
+    def load_scenes() -> None:
+        nonlocal scenes_list, scene_sel
+        try:
+            r = pi8_audio_http.get_scenes()
+            scenes_list = list(r.get("scenes") or [])
+            if scenes_list:
+                scene_sel = min(scene_sel, len(scenes_list) - 1)
+            else:
+                scene_sel = 0
+        except (pi8_audio_http.Pi8AudioHttpError, OSError):
+            scenes_list = []
+            scene_sel = 0
+
+    def load_legacy_names() -> None:
+        nonlocal legacy_names, legacy_sel
+        try:
+            r = pi8_audio_http.get_presets()
+            presets = r.get("presets") or {}
+            if isinstance(presets, dict):
+                legacy_names = sorted(presets.keys())
+            else:
+                legacy_names = []
+            if legacy_names:
+                legacy_sel = min(legacy_sel, len(legacy_names) - 1)
+            else:
+                legacy_sel = 0
+        except (pi8_audio_http.Pi8AudioHttpError, OSError):
+            legacy_names = []
+            legacy_sel = 0
 
     def target_from_sel() -> str | None:
         return [None, "front", "rear"][sync_sel]
@@ -614,9 +903,52 @@ def run(stdscr) -> None:
             draw_buffers()
         elif view == "audio_levels":
             draw_levels()
-        elif view in PLACEHOLDER_VIEWS:
-            title = view.capitalize() if view != "presets" else "Presets"
-            draw_placeholder(stdscr, title)
+        elif view == "display_menu":
+            draw_submenu(
+                stdscr,
+                "Display",
+                DISPLAY_MENU,
+                display_menu_sel,
+                display_status,
+                "Display",
+            )
+        elif view == "display_quick":
+            draw_display_quick(
+                stdscr,
+                DISPLAY_MODES[dq_mode_i],
+                dq_overlay,
+                dq_mirror,
+                dq_lyrics,
+                VIS_THEMES[dq_theme_i],
+                display_status,
+            )
+        elif view == "display_sleep":
+            draw_display_sleep(stdscr, sleep_active, sleep_remaining_s, display_status)
+        elif view == "display_raw":
+            draw_display_raw(stdscr, display_status)
+        elif view == "presets_menu":
+            draw_submenu(
+                stdscr,
+                "Presets",
+                PRESETS_MENU,
+                presets_menu_sel,
+                presets_status,
+                "Presets",
+            )
+        elif view == "presets_scenes":
+            draw_presets_scenes(stdscr, scenes_list, scene_sel, presets_status)
+        elif view == "presets_legacy":
+            draw_presets_legacy(stdscr, legacy_names, legacy_sel, presets_status)
+        elif view == "system_menu":
+            draw_system_menu(stdscr, system_status)
+        elif view == "tools_menu":
+            draw_tools_menu(stdscr, tools_menu_sel, tools_status)
+        elif view == "tools_calib":
+            draw_tools_calib(
+                stdscr, tools_calib_vol, tools_calib_fo, tools_calib_ro, tools_status
+            )
+        elif view == "tools_sync":
+            draw_tools_sync(stdscr, tools_status)
         else:
             return
 
@@ -639,6 +971,17 @@ def run(stdscr) -> None:
                     refresh_dashboard()
                 elif view == "audio":
                     audio_menu_sel = 0
+                elif view == "display_menu":
+                    display_menu_sel = 0
+                    display_status = ""
+                elif view == "presets_menu":
+                    presets_menu_sel = 0
+                    presets_status = ""
+                elif view == "system_menu":
+                    system_status = ""
+                elif view == "tools_menu":
+                    tools_menu_sel = 0
+                    tools_status = ""
             elif ch in (10, 13):
                 dest = apply_menu_selection(menu_sel)
                 if dest is None:
@@ -648,6 +991,17 @@ def run(stdscr) -> None:
                     refresh_dashboard()
                 elif view == "audio":
                     audio_menu_sel = 0
+                elif view == "display_menu":
+                    display_menu_sel = 0
+                    display_status = ""
+                elif view == "presets_menu":
+                    presets_menu_sel = 0
+                    presets_status = ""
+                elif view == "system_menu":
+                    system_status = ""
+                elif view == "tools_menu":
+                    tools_menu_sel = 0
+                    tools_status = ""
             continue
 
         if view == "dashboard":
@@ -969,9 +1323,357 @@ def run(stdscr) -> None:
             draw_levels()
             continue
 
-        if view in PLACEHOLDER_VIEWS:
-            if ch in (ord("q"), ord("Q"), ord("0")):
+        if view == "display_menu":
+            if ch in (ord("q"), ord("Q")):
                 view = "menu"
+                display_status = ""
+                continue
+            if ch == curses.KEY_UP and display_menu_sel > 0:
+                display_menu_sel -= 1
+            elif ch == curses.KEY_DOWN and display_menu_sel < len(DISPLAY_MENU) - 1:
+                display_menu_sel += 1
+            elif ord("1") <= ch <= ord("3"):
+                display_menu_sel = ch - ord("1")
+                sub = ["display_quick", "display_sleep", "display_raw"][display_menu_sel]
+                view = sub
+                display_status = ""
+                if view == "display_quick":
+                    load_display_draft()
+                elif view == "display_sleep":
+                    load_sleep_status()
+            elif ch in (10, 13):
+                sub = ["display_quick", "display_sleep", "display_raw"][display_menu_sel]
+                view = sub
+                display_status = ""
+                if view == "display_quick":
+                    load_display_draft()
+                elif view == "display_sleep":
+                    load_sleep_status()
+            continue
+
+        if view == "display_quick":
+            if ch in (ord("q"), ord("Q")):
+                view = "display_menu"
+                continue
+            if ch == ord("m"):
+                dq_mode_i = (dq_mode_i + 1) % len(DISPLAY_MODES)
+            elif ch == ord("o"):
+                dq_overlay = not dq_overlay
+            elif ch == ord("v"):
+                dq_mirror = not dq_mirror
+            elif ch == ord("l"):
+                dq_lyrics = not dq_lyrics
+            elif ch == ord("t"):
+                dq_theme_i = (dq_theme_i + 1) % len(VIS_THEMES)
+            elif ch == ord("r"):
+                load_display_draft()
+                display_status = "reloaded from /display-state"
+            elif ch == ord("a"):
+                try:
+                    body = {
+                        "mode": DISPLAY_MODES[dq_mode_i],
+                        "overlay_enabled": dq_overlay,
+                        "visualizer_mirror": dq_mirror,
+                        "lyrics_enabled": dq_lyrics,
+                        "visualizer_theme": VIS_THEMES[dq_theme_i],
+                    }
+                    out = pi8_audio_http.post_display(body)
+                    display_status = json.dumps(out, sort_keys=True)[:200]
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    display_status = str(e)
+            continue
+
+        if view == "display_sleep":
+            if ch in (ord("q"), ord("Q")):
+                view = "display_menu"
+                continue
+            if ch == ord("r"):
+                load_sleep_status()
+            elif ch == ord("c"):
+                try:
+                    pi8_audio_http.delete_sleep_timer()
+                    display_status = "cancelled"
+                    load_sleep_status()
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    display_status = str(e)
+            elif ch == ord("s"):
+                stdscr.erase()
+                draw_display_sleep(stdscr, sleep_active, sleep_remaining_s, display_status)
+                my, mx = stdscr.getmaxyx()
+                prompt = "Minutes (float): "
+                safe_addstr(stdscr, my - 2, 0, _trunc(prompt, mx))
+                raw = _read_line_cell(stdscr, my - 2, len(prompt), 20)
+                if raw:
+                    try:
+                        mins = float(raw)
+                        if mins > 0:
+                            out = pi8_audio_http.post_sleep_timer_minutes(mins)
+                            display_status = json.dumps(out, sort_keys=True)[:200]
+                            load_sleep_status()
+                    except (ValueError, pi8_audio_http.Pi8AudioHttpError) as e:
+                        display_status = str(e)
+            continue
+
+        if view == "display_raw":
+            if ch in (ord("q"), ord("Q")):
+                view = "display_menu"
+                continue
+            if ch == ord("e"):
+                path = ""
+                try:
+                    snap = pi8_audio_http.get_display_state()
+                    fd, path = tempfile.mkstemp(suffix=".json", prefix="pi8-display-")
+                    os.close(fd)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(snap, f, indent=2)
+                        f.write("\n")
+                    curses.endwin()
+                    try:
+                        ed = os.environ.get("EDITOR", "nano")
+                        subprocess.run(shlex.split(ed) + [path], check=False)
+                    finally:
+                        stdscr.refresh()
+                    with open(path, encoding="utf-8") as f:
+                        body = json.load(f)
+                    if not isinstance(body, dict):
+                        raise ValueError("JSON root must be object")
+                    out = pi8_audio_http.post_display(body)
+                    display_status = json.dumps(out, sort_keys=True)[:240]
+                except (OSError, json.JSONDecodeError, ValueError) as e:
+                    display_status = f"error: {e}"
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    display_status = str(e)
+                finally:
+                    if path:
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+            continue
+
+        if view == "presets_menu":
+            if ch in (ord("q"), ord("Q")):
+                view = "menu"
+                presets_status = ""
+                continue
+            if ch == curses.KEY_UP and presets_menu_sel > 0:
+                presets_menu_sel -= 1
+            elif ch == curses.KEY_DOWN and presets_menu_sel < len(PRESETS_MENU) - 1:
+                presets_menu_sel += 1
+            elif ord("1") <= ch <= ord("2"):
+                presets_menu_sel = ch - ord("1")
+                view = ["presets_scenes", "presets_legacy"][presets_menu_sel]
+                presets_status = ""
+                if view == "presets_scenes":
+                    load_scenes()
+                else:
+                    load_legacy_names()
+            elif ch in (10, 13):
+                view = ["presets_scenes", "presets_legacy"][presets_menu_sel]
+                presets_status = ""
+                if view == "presets_scenes":
+                    load_scenes()
+                else:
+                    load_legacy_names()
+            continue
+
+        if view == "presets_scenes":
+            if ch in (ord("q"), ord("Q")):
+                view = "presets_menu"
+                continue
+            if ch == ord("r"):
+                load_scenes()
+            elif ch == ord("e"):
+                curses.endwin()
+                try:
+                    ed = os.environ.get("EDITOR", "nano")
+                    subprocess.run(shlex.split(ed) + [SCENE_STORE_PATH], check=False)
+                finally:
+                    stdscr.refresh()
+                load_scenes()
+                presets_status = "reloaded scenes list"
+            elif scenes_list and ch in (10, 13):
+                sc = scenes_list[scene_sel]
+                name = str(sc.get("name", "")).strip()
+                if name:
+                    try:
+                        out = pi8_audio_http.post_scene_apply(name)
+                        presets_status = json.dumps(out, sort_keys=True)[:200]
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        presets_status = str(e)
+            elif ch == curses.KEY_UP and scene_sel > 0:
+                scene_sel -= 1
+            elif ch == curses.KEY_DOWN and scene_sel < len(scenes_list) - 1:
+                scene_sel += 1
+            continue
+
+        if view == "presets_legacy":
+            if ch in (ord("q"), ord("Q")):
+                view = "presets_menu"
+                continue
+            if ch == ord("r"):
+                load_legacy_names()
+            elif ch == ord("s"):
+                stdscr.erase()
+                draw_presets_legacy(stdscr, legacy_names, legacy_sel, presets_status)
+                my, mx = stdscr.getmaxyx()
+                prompt = "Save preset name: "
+                safe_addstr(stdscr, my - 2, 0, _trunc(prompt, mx))
+                name = _read_line_cell(stdscr, my - 2, len(prompt), 64).strip()
+                if name:
+                    try:
+                        out = pi8_audio_http.post_presets_save(
+                            name, snapshot_from_state=True
+                        )
+                        presets_status = json.dumps(out, sort_keys=True)[:200]
+                        load_legacy_names()
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        presets_status = str(e)
+            elif ch == ord("d") and legacy_names:
+                stdscr.erase()
+                draw_presets_legacy(stdscr, legacy_names, legacy_sel, presets_status)
+                my, mx = stdscr.getmaxyx()
+                prompt = "Delete preset name: "
+                safe_addstr(stdscr, my - 2, 0, _trunc(prompt, mx))
+                name = _read_line_cell(stdscr, my - 2, len(prompt), 64).strip()
+                if name:
+                    try:
+                        out = pi8_audio_http.post_presets_delete(name)
+                        presets_status = json.dumps(out, sort_keys=True)[:200]
+                        load_legacy_names()
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        presets_status = str(e)
+            elif legacy_names and ch in (10, 13):
+                name = legacy_names[legacy_sel]
+                try:
+                    out = pi8_audio_http.post_presets_load(name)
+                    presets_status = json.dumps(out, sort_keys=True)[:200]
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    presets_status = str(e)
+            elif ch == curses.KEY_UP and legacy_sel > 0:
+                legacy_sel -= 1
+            elif ch == curses.KEY_DOWN and legacy_sel < len(legacy_names) - 1:
+                legacy_sel += 1
+            continue
+
+        if view == "system_menu":
+            if ch in (ord("q"), ord("Q")):
+                view = "menu"
+                system_status = ""
+                continue
+            if ord("1") <= ch <= ord("8"):
+                idx = ch - ord("1")
+                if 0 <= idx < len(SYSTEM_MENU_LINES):
+                    _k, _lab, svc, scope = SYSTEM_MENU_LINES[idx]
+                    try:
+                        out = pi8_audio_http.post_restart_service(svc, scope=scope)
+                        system_status = json.dumps(out, sort_keys=True)[:200]
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        system_status = str(e)
+            elif ch in (ord("p"), ord("P")):
+                if draw_confirm(
+                    stdscr,
+                    "Power STOP — stops PipeWire, BT, receivers (web /power stop)?",
+                    "Web UI may stay up.",
+                ):
+                    try:
+                        out = pi8_audio_http.post_power("stop")
+                        system_status = json.dumps(out, sort_keys=True)[:200]
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        system_status = str(e)
+            elif ch in (ord("s"), ord("S")):
+                if draw_confirm(
+                    stdscr,
+                    "Power START — start audio stack (web /power start)?",
+                    "",
+                ):
+                    try:
+                        out = pi8_audio_http.post_power("start")
+                        system_status = json.dumps(out, sort_keys=True)[:200]
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        system_status = str(e)
+            continue
+
+        if view == "tools_menu":
+            if ch in (ord("q"), ord("Q")):
+                view = "menu"
+                tools_status = ""
+                continue
+            if ch == curses.KEY_UP and tools_menu_sel > 0:
+                tools_menu_sel -= 1
+            elif ch == curses.KEY_DOWN and tools_menu_sel < len(TOOLS_MENU) - 1:
+                tools_menu_sel += 1
+            elif ord("1") <= ch <= ord("2"):
+                tools_menu_sel = ch - ord("1")
+                view = ["tools_calib", "tools_sync"][tools_menu_sel]
+                tools_status = ""
+            elif ch in (10, 13):
+                view = ["tools_calib", "tools_sync"][tools_menu_sel]
+                tools_status = ""
+            continue
+
+        if view == "tools_calib":
+            if ch in (ord("q"), ord("Q")):
+                view = "tools_menu"
+                continue
+            if ch == ord("s"):
+                if draw_confirm(
+                    stdscr,
+                    "Start calibration noise stream?",
+                    "POST /calib-stream action=start",
+                ):
+                    try:
+                        out = pi8_audio_http.post_calib_stream(
+                            "start",
+                            front_offset_ms=tools_calib_fo,
+                            rear_offset_ms=tools_calib_ro,
+                            volume=tools_calib_vol,
+                        )
+                        tools_status = json.dumps(out, sort_keys=True)[:200]
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        tools_status = str(e)
+            elif ch == ord("x"):
+                try:
+                    out = pi8_audio_http.post_calib_stream("stop")
+                    tools_status = json.dumps(out, sort_keys=True)[:200]
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    tools_status = str(e)
+            elif ch == ord("u"):
+                try:
+                    out = pi8_audio_http.post_calib_stream(
+                        "update",
+                        front_offset_ms=tools_calib_fo,
+                        rear_offset_ms=tools_calib_ro,
+                        volume=tools_calib_vol,
+                    )
+                    tools_status = json.dumps(out, sort_keys=True)[:200]
+                except pi8_audio_http.Pi8AudioHttpError as e:
+                    tools_status = str(e)
+            elif ch == ord("+") or ch == ord("="):
+                tools_calib_vol = min(100.0, tools_calib_vol + 2.0)
+            elif ch == ord("-") or ch == ord("_"):
+                tools_calib_vol = max(0.0, tools_calib_vol - 2.0)
+            elif ch == ord("f"):
+                tools_calib_fo = min(500.0, tools_calib_fo + 0.5)
+            elif ch == ord("r"):
+                tools_calib_ro = min(500.0, tools_calib_ro + 0.5)
+            continue
+
+        if view == "tools_sync":
+            if ch in (ord("q"), ord("Q")):
+                view = "tools_menu"
+                continue
+            if ch == ord("t"):
+                if draw_confirm(
+                    stdscr,
+                    "Run sync test tone (POST /play-sync-test)?",
+                    "Uses current front/rear offsets 0/0 from client.",
+                ):
+                    try:
+                        out = pi8_audio_http.post_play_sync_test(0.0, 0.0)
+                        tools_status = json.dumps(out, sort_keys=True)[:200]
+                    except pi8_audio_http.Pi8AudioHttpError as e:
+                        tools_status = str(e)
             continue
 
 

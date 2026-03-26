@@ -242,6 +242,177 @@ class TestPi8AudioHttp(unittest.TestCase):
                 self.assertEqual(req.get_full_url(), "http://127.0.0.1:8083/volume")
                 self.assertEqual(req.method, "GET")
 
+    def test_get_presets(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "presets": {"a": {}}}).encode()
+                )
+                out = pi8_audio_http.get_presets()
+                self.assertIn("presets", out)
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/presets"))
+                self.assertEqual(req.method, "GET")
+
+    def test_get_scenes(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "scenes": []}).encode()
+                )
+                pi8_audio_http.get_scenes()
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/scenes"))
+                self.assertEqual(req.method, "GET")
+
+    def test_post_scene_apply(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True}).encode()
+                )
+                pi8_audio_http.post_scene_apply("tv-bt-hdmi")
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/scene/apply"))
+                self.assertEqual(json.loads(req.data.decode()), {"name": "tv-bt-hdmi"})
+
+    def test_post_display(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(json.dumps({"ok": True}).encode())
+                pi8_audio_http.post_display(
+                    {
+                        "mode": "visualizer",
+                        "overlay_enabled": True,
+                        "visualizer_mirror": False,
+                    }
+                )
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/display"))
+                body = json.loads(req.data.decode())
+                self.assertEqual(body["mode"], "visualizer")
+                self.assertTrue(body["overlay_enabled"])
+
+    def test_post_sleep_timer_minutes(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "minutes": 45}).encode()
+                )
+                pi8_audio_http.post_sleep_timer_minutes(45)
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/sleep-timer"))
+                self.assertEqual(json.loads(req.data.decode()), {"minutes": 45.0})
+
+    def test_delete_sleep_timer(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True}).encode()
+                )
+                pi8_audio_http.delete_sleep_timer()
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/sleep-timer"))
+                self.assertEqual(req.method, "DELETE")
+                self.assertIsNone(req.data)
+
+    def test_get_sleep_timer(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"active": False, "remaining_seconds": 0}).encode()
+                )
+                out = pi8_audio_http.get_sleep_timer()
+                self.assertFalse(out["active"])
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/sleep-timer"))
+                self.assertEqual(req.method, "GET")
+
+    def test_post_restart_service(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "msg": "ok"}).encode()
+                )
+                pi8_audio_http.post_restart_service("DISPLAY_RESTART", scope="user")
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/restart-service"))
+                self.assertEqual(
+                    json.loads(req.data.decode()),
+                    {"service": "DISPLAY_RESTART", "scope": "user"},
+                )
+
+    def test_post_power(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "msg": "stopped"}).encode()
+                )
+                pi8_audio_http.post_power("stop")
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/power"))
+                self.assertEqual(json.loads(req.data.decode()), {"action": "stop"})
+
+    def test_post_calib_stream(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "streaming": True}).encode()
+                )
+                pi8_audio_http.post_calib_stream(
+                    "update", front_offset_ms=1.5, rear_offset_ms=0, volume=80
+                )
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/calib-stream"))
+                b = json.loads(req.data.decode())
+                self.assertEqual(b["action"], "update")
+                self.assertEqual(b["volume"], 80.0)
+
+    def test_post_play_sync_test(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(json.dumps({"ok": True}).encode())
+                pi8_audio_http.post_play_sync_test(0, 0)
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/play-sync-test"))
+                self.assertEqual(
+                    json.loads(req.data.decode()),
+                    {"front_offset_ms": 0.0, "rear_offset_ms": 0.0},
+                )
+
+    def test_post_presets_save(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "presets": {}}).encode()
+                )
+                pi8_audio_http.post_presets_save("my-preset", snapshot_from_state=True)
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/presets"))
+                self.assertEqual(json.loads(req.data.decode()), {"name": "my-preset"})
+
+    def test_post_presets_load(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "msg": "loaded"}).encode()
+                )
+                pi8_audio_http.post_presets_load("x")
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/presets/load"))
+                self.assertEqual(json.loads(req.data.decode()), {"name": "x"})
+
+    def test_post_presets_delete(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "presets": {}}).encode()
+                )
+                pi8_audio_http.post_presets_delete("x")
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/presets/delete"))
+                self.assertEqual(json.loads(req.data.decode()), {"name": "x"})
+
 
 if __name__ == "__main__":
     unittest.main()
