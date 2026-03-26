@@ -69,6 +69,35 @@ class TestPi8AudioHttp(unittest.TestCase):
                 self.assertEqual(req.method, "GET")
                 self.assertIsNone(req.data)
 
+    def test_post_apply_delay_front(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://example:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "applying": True}).encode()
+                )
+                out = pi8_audio_http.post_apply_delay("front", 12.5)
+                self.assertEqual(out["ok"], True)
+                req = m.call_args[0][0]
+                self.assertTrue(req.get_full_url().endswith("/apply"))
+                self.assertEqual(req.method, "POST")
+                body = json.loads(req.data.decode())
+                self.assertEqual(body["target"], "front")
+                self.assertEqual(body["delay_ms"], 12.5)
+
+    def test_post_apply_delay_none_target(self):
+        with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://127.0.0.1:8083"}):
+            with patch("urllib.request.urlopen") as m:
+                m.return_value = _mock_http_response(
+                    json.dumps({"ok": True, "applying": True}).encode()
+                )
+                pi8_audio_http.post_apply_delay(None, 0)
+                req = m.call_args[0][0]
+                raw = req.data.decode()
+                self.assertIn('"target": null', raw)
+                body = json.loads(raw)
+                self.assertIsNone(body["target"])
+                self.assertEqual(body["delay_ms"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

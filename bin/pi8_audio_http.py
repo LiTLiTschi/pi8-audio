@@ -54,7 +54,7 @@ POST paths
 | /sleep-timer      | post_sleep_timer      |
 | /debug-volume     | post_debug_volume     |
 | /debug-test       | post_debug_test       |
-| /apply            | post_apply            |
+| /apply            | post_apply_delay      |
 """
 from __future__ import annotations
 
@@ -143,4 +143,13 @@ def post_hdmi(enabled: bool, port: int = 0, outputs_front_rear: bool = True) -> 
             "port": port,
             "outputs_front_rear": outputs_front_rear,
         },
+    )
+
+
+def post_apply_delay(target: str | None, delay_ms: float) -> dict[str, Any]:
+    """POST /apply with the same JSON shape as the web UI: `target` and `delay_ms`."""
+    return _request(
+        "POST",
+        "/apply",
+        {"target": target, "delay_ms": delay_ms},
     )
