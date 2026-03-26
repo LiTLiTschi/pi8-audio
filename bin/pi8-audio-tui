@@ -73,13 +73,12 @@ def draw_simple_profile_warning(stdscr) -> bool:
     stdscr.erase()
     my, mx = stdscr.getmaxyx()
     lines = [
-        "simple profile ignores delay/surround;",
-        "continue?",
+        "simple profile ignores delay/surround; continue? y/N",
         "",
         "y = yes, any other key = no",
     ]
     for i, ln in enumerate(lines):
-        safe_addstr(stdscr, 2 + i, 0, _trunc(ln, mx), curses.A_BOLD if i < 2 else 0)
+        safe_addstr(stdscr, 2 + i, 0, _trunc(ln, mx), curses.A_BOLD if i < 1 else 0)
     safe_addstr(stdscr, my - 1, 0, _trunc("Warning — profile", mx), curses.A_DIM)
     stdscr.nodelay(False)
     ch = stdscr.getch()

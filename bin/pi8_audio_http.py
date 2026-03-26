@@ -200,12 +200,12 @@ def post_balance(balance: int) -> Any:
 
 
 def post_volume(volume: int, mute_toggle: bool = False) -> Any:
-    body: dict[str, Any]
-    if mute_toggle:
-        body = {"mute_toggle": True}
-    else:
-        body = {"volume": volume}
-    return _request("POST", "/volume", body)
+    """POST /volume — same keys as audio-sync-web (`{volume, mute_toggle}`)."""
+    return _request(
+        "POST",
+        "/volume",
+        {"volume": int(volume), "mute_toggle": bool(mute_toggle)},
+    )
 
 
 def post_audio_profile(profile: str) -> Any:

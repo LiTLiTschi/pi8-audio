@@ -192,7 +192,10 @@ class TestPi8AudioHttp(unittest.TestCase):
                 )
                 pi8_audio_http.post_volume(33, mute_toggle=False)
                 req = m.call_args[0][0]
-                self.assertEqual(json.loads(req.data.decode()), {"volume": 33})
+                self.assertEqual(
+                    json.loads(req.data.decode()),
+                    {"volume": 33, "mute_toggle": False},
+                )
 
             with patch("urllib.request.urlopen") as m:
                 m.return_value = _mock_http_response(
@@ -200,7 +203,10 @@ class TestPi8AudioHttp(unittest.TestCase):
                 )
                 pi8_audio_http.post_volume(0, mute_toggle=True)
                 req = m.call_args[0][0]
-                self.assertEqual(json.loads(req.data.decode()), {"mute_toggle": True})
+                self.assertEqual(
+                    json.loads(req.data.decode()),
+                    {"volume": 0, "mute_toggle": True},
+                )
 
     def test_post_audio_profile(self):
         with patch.dict(os.environ, {"PI8_AUDIO_SYNC_URL": "http://example:8083"}):
